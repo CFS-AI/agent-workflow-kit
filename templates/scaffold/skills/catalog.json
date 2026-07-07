@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "skills": [
+    {
+      "id": "codex-delegate",
+      "displayName": "Codex Delegate",
+      "description": "Delegate routine implementation to Codex with task envelope, isolated worktrees and review-gate.",
+      "bundled": false,
+      "allowedRoles": ["compose", "plan", "build", "review"]
+    },
+    {
+      "id": "dev-status",
+      "displayName": "Dev Status",
+      "description": "Use dev/status.md as durable current state and update it after meaningful changes.",
+      "bundled": false,
+      "allowedRoles": ["compose", "general"]
+    },
+    {
+      "id": "session-handoff",
+      "displayName": "Session Handoff",
+      "description": "Create a compact handoff with goal, state, files, verification and next steps.",
+      "bundled": false,
+      "allowedRoles": ["compose", "docs-writer", "general"]
+    }
+  ]
+}

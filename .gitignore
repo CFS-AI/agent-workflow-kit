@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.claude/cache/
+.scaffold/runtime/
+.scaffold/pipeline/
+.scaffold/tasks/current/
+dev/daily/.hub-check-stamp
+dev/daily/.weekly-review-stamp
+node_modules/
+__pycache__/
+*.pyc
+tmp/

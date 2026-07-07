@@ -1,0 +1,14 @@
+# Lines are extended grep patterns. The scrub script ignores this file itself.
+# Add your organization's private terms here before publishing a derived kit.
+OPENROUTER_API_KEY=
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+sk-[A-Za-z0-9_-]{20,}
+Bearer [A-Za-z0-9._-]{20,}
+password[=:]
+sessionid
+cookie:
+salary[[:space:]]*[:=][[:space:]]*[0-9]
+payroll[[:space:]]*[:=][[:space:]]*[0-9]
+client[[:space:]]+(name|phone|email)[[:space:]]*[:=]
+raw[[:space:]]+transcript[[:space:]]*[:=]

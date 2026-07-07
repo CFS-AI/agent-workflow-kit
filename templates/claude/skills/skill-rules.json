@@ -1,0 +1,24 @@
+{
+  "version": "1.0",
+  "description": "Skill auto-activation rules for Agent Workflow Kit",
+  "rules": [
+    {
+      "skill": "codex-delegate",
+      "triggers": {
+        "keywords": [
+          "delegate", "codex", "implement", "write tests", "refactor",
+          "делегируй", "реализуй", "напиши тест", "рефактор"
+        ],
+        "min_keyword_matches": 1,
+        "always_load": false
+      },
+      "priority": 10
+    }
+  ],
+  "context_management": {
+    "max_skills_per_session": 3,
+    "compression_threshold_lines": 300,
+    "status_file": "dev/status.md",
+    "always_load_status": true
+  }
+}
