@@ -46,3 +46,23 @@ Codex never commits, pushes, rebases or resets. The orchestrator does review-gat
 - `dev/codex-tasks/` — task envelopes and handoffs.
 
 This is not a replacement for product docs. Promote repeated runbooks into docs or skills during weekly review.
+
+## 6. Optional CFS pack
+
+The CFS pack adds two reusable operational loops:
+
+### cfs-hub loop
+
+```text
+hub_status → diff against last infra check → hub_target(new CRIT) → classify next action
+```
+
+Key semantic: `UNKNOWN` is a missing-signal/config state, not proof of downtime.
+
+### CFS Docs loop
+
+```text
+docs-intel search_docs/get_doc before work → update docs after behavior/deploy/runbook changes
+```
+
+The pack excludes personal `/eod` and private daily/status content. It carries only shareable workflow patterns and placeholder MCP config.

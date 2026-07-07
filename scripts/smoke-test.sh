@@ -9,7 +9,19 @@ trap 'rm -rf "$DEMO"' EXIT
 mkdir -p "$DEMO/project"
 echo "# Demo" > "$DEMO/project/README.md"
 
-"$ROOT/scripts/apply-kit.sh" "$DEMO/project" >/tmp/agent-workflow-apply.log
+APPLY_ARGS=()
+if [ "${AGENT_WORKFLOW_SMOKE_PACKS:-}" != "" ]; then
+  IFS=',' read -r -a packs <<< "$AGENT_WORKFLOW_SMOKE_PACKS"
+  for pack in "${packs[@]}"; do
+    APPLY_ARGS+=("--pack" "$pack")
+  done
+fi
+
+if [ ${#APPLY_ARGS[@]} -gt 0 ]; then
+  "$ROOT/scripts/apply-kit.sh" "${APPLY_ARGS[@]}" "$DEMO/project" >/tmp/agent-workflow-apply.log
+else
+  "$ROOT/scripts/apply-kit.sh" "$DEMO/project" >/tmp/agent-workflow-apply.log
+fi
 
 required=(
   "CLAUDE.md"
@@ -32,6 +44,23 @@ required=(
 for file in "${required[@]}"; do
   test -e "$DEMO/project/$file" || { echo "missing: $file" >&2; exit 1; }
 done
+
+if [[ ",${AGENT_WORKFLOW_SMOKE_PACKS:-}," == *",cfs,"* ]]; then
+  cfs_required=(
+    ".claude/skills/cfs-hub-ops/SKILL.md"
+    ".claude/skills/cfs-docs-update/SKILL.md"
+    ".scaffold/skills/cfs-hub-ops.md"
+    ".scaffold/skills/cfs-docs-update.md"
+    ".mcp.cfs.example.json"
+    "docs/CFS_PACK.md"
+  )
+  for file in "${cfs_required[@]}"; do
+    test -e "$DEMO/project/$file" || { echo "missing CFS pack file: $file" >&2; exit 1; }
+  done
+  node -e "JSON.parse(require('fs').readFileSync('$DEMO/project/.mcp.cfs.example.json','utf8'))"
+  grep -q 'cfs-hub-ops' "$DEMO/project/.claude/skills/skill-rules.json"
+  grep -q 'cfs-docs-update' "$DEMO/project/.scaffold/skills/catalog.json"
+fi
 
 node -e "JSON.parse(require('fs').readFileSync('$DEMO/project/.claude/settings.json','utf8'))"
 node -e "JSON.parse(require('fs').readFileSync('$DEMO/project/.claude/skills/skill-rules.json','utf8'))"

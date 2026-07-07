@@ -12,3 +12,6 @@ salary[[:space:]]*[:=][[:space:]]*[0-9]
 payroll[[:space:]]*[:=][[:space:]]*[0-9]
 client[[:space:]]+(name|phone|email)[[:space:]]*[:=]
 raw[[:space:]]+transcript[[:space:]]*[:=]
+81\.200\.158\.102
+openclaw-ops/dev/daily
+dev/eod-[0-9]{4}-[0-9]{2}-[0-9]{2}

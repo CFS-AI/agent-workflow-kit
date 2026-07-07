@@ -10,6 +10,14 @@ Before sharing a derived workflow kit, remove:
 - vendor account emails/passwords;
 - project-specific incident details that identify a person or customer.
 
+For the CFS pack specifically, also keep out:
+
+- personal `/eod` rollups;
+- CEO/private personal task summaries;
+- raw `dev/status.md` or `dev/daily/*.md` from a live workspace;
+- live IPs/private hostnames unless intentionally public;
+- raw hub logs or docs-intel source excerpts containing private data.
+
 Run:
 
 ```bash

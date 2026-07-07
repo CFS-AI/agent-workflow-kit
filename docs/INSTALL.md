@@ -6,6 +6,9 @@
 git clone <this-repo-url> agent-workflow-kit
 cd agent-workflow-kit
 ./scripts/apply-kit.sh /path/to/project
+
+# Optional CFS/OpenClaw ops pack:
+./scripts/apply-kit.sh --pack cfs /path/to/project
 ```
 
 The script creates:
@@ -23,6 +26,17 @@ The script creates:
 - `dev/status.md`
 - `dev/daily/.gitkeep`
 
+With `--pack cfs`, it also creates:
+
+- `.claude/skills/cfs-hub-ops/SKILL.md`
+- `.claude/skills/cfs-docs-update/SKILL.md`
+- `.scaffold/skills/cfs-hub-ops.md`
+- `.scaffold/skills/cfs-docs-update.md`
+- `.mcp.cfs.example.json`
+- `docs/CFS_PACK.md`
+
+and merges CFS skill hints into `.claude/skills/skill-rules.json` plus Scaffold catalog entries.
+
 Existing files are not overwritten unless you pass `--force`.
 
 ## Customize after install
@@ -35,6 +49,12 @@ Existing files are not overwritten unless you pass `--force`.
 ```bash
 ./scripts/scrub-check.sh
 ./scripts/smoke-test.sh
+```
+
+For CFS pack validation:
+
+```bash
+AGENT_WORKFLOW_SMOKE_PACKS=cfs ./scripts/smoke-test.sh
 ```
 
 ## Updating a project

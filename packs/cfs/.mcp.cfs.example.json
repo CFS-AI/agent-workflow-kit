@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "cfs-hub": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "${CFS_HUB_REPO}",
+        "--extra",
+        "mcp",
+        "cfs-hub-mcp"
+      ],
+      "env": {}
+    },
+    "docs-intel-team-dev": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "${CFS_DOCS_REPO}/scripts/run_docs_mcp.sh",
+        "team_dev"
+      ],
+      "env": {
+        "DOCS_INTEL_CORPUS": "team_dev"
+      }
+    },
+    "docs-intel-legal": {
+      "type": "stdio",
+      "command": "bash",
+      "args": [
+        "${CFS_DOCS_REPO}/scripts/run_docs_mcp.sh",
+        "legal"
+      ],
+      "env": {
+        "DOCS_INTEL_CORPUS": "legal"
+      }
+    }
+  }
+}

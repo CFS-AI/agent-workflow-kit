@@ -6,7 +6,7 @@ Shareable workflow template for running an engineering workspace with three coop
 - **Scaffold / prime** — structured clarification → diagnosis → plan → approval → build/review loop.
 - **Codex Delegate** — routine implementation in a sandbox/worktree, accepted only through review-gate.
 
-The kit is intentionally domain-neutral: no client data, no company-specific runbooks, no credentials, no live infrastructure assumptions.
+The default install is domain-neutral. Optional packs add reusable domain workflows without secrets or private data.
 
 ## What you get
 
@@ -15,6 +15,8 @@ templates/
   claude/              # CLAUDE.md, AGENTS.md, hooks, codex-delegate skill
   scaffold/            # context/rules/constraints/done-criteria + skill index cards
   demo-workspace/      # tiny project used by smoke-test
+packs/
+  cfs/                 # optional CFS/OpenClaw ops pack: cfs-hub + docs-intel workflows
 scripts/
   apply-kit.sh         # copy templates into a target repository
   codex-exec.sh        # hardened Codex CLI wrapper
@@ -36,6 +38,9 @@ cd agent-workflow-kit
 
 # Apply to an existing project:
 ./scripts/apply-kit.sh /path/to/your/project
+
+# Apply core + CFS pack:
+./scripts/apply-kit.sh --pack cfs /path/to/your/project
 ```
 
 After applying, open the target project in Claude Code or Scaffold and read:
@@ -54,6 +59,16 @@ Then customize placeholders marked `TODO:`.
 3. **Delegate routine work, not ownership.** Codex can edit; the orchestrator reviews, tests and commits.
 4. **One writer per worktree.** Parallel agents get isolated git worktrees.
 5. **Publish only scrubbed artifacts.** Run `./scripts/scrub-check.sh` before pushing.
+
+## Optional CFS pack
+
+The CFS pack is for OpenClaw/CFS-style operations and includes:
+
+- `cfs-hub-ops` — read-only infra monitoring triage through cfs-hub MCP;
+- `cfs-docs-update` — docs-first + docs-update workflow around CFS Docs/docs-intel;
+- `.mcp.cfs.example.json` — placeholder MCP config for `cfs-hub`, `docs-intel-team-dev`, `docs-intel-legal`.
+
+It deliberately excludes personal `/eod`, CEO private rollups, raw daily/status files, live secrets, raw client data and live infrastructure addresses.
 
 ## License
 
