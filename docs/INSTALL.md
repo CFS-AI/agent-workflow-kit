@@ -23,6 +23,7 @@ The script creates:
 - `.scaffold/done-criteria.md`
 - `.scaffold/skills/*`
 - `scripts/dev/codex-exec.sh`
+- `scripts/dev/setup-codex-mcp.sh`
 - `dev/status.md`
 - `dev/daily/.gitkeep`
 
@@ -38,6 +39,17 @@ With `--pack cfs`, it also creates:
 and merges CFS skill hints into `.claude/skills/skill-rules.json` plus Scaffold catalog entries.
 
 Existing files are not overwritten unless you pass `--force`.
+
+## Optional Codex MCP transport
+
+The delegate skill works through CLI background work without MCP. To enable the interactive Claude Code ↔ Codex transport, run inside the target repository:
+
+```bash
+scripts/dev/setup-codex-mcp.sh --scope user
+scripts/dev/setup-codex-mcp.sh --check
+```
+
+The script registers the stdio server `codex mcp-server`. It does not write credentials and refuses to overwrite a different existing MCP named `codex`. Use `--scope project` only when the transport must be project-local.
 
 ## Customize after install
 

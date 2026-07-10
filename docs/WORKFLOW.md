@@ -35,7 +35,7 @@ Keep `.scaffold/context.md`, `.scaffold/rules.md`, `.scaffold/constraints.md` an
 
 ## 4. Codex Delegate surface
 
-Use Codex for routine implementation, tests, refactors and codebase research after the orchestrator has defined the task envelope.
+Use Codex for routine implementation, tests, refactors and codebase research after the orchestrator has defined the task envelope. Profile by responsibility: Prime = Sol/xhigh, Plan/Review = Terra/high, Build = Luna/high, Simple = Luna/medium; Develop is Plan → Build → Review.
 
 Codex never commits, pushes, rebases or resets. The orchestrator does review-gate and commits only after verification.
 
@@ -47,7 +47,20 @@ Codex never commits, pushes, rebases or resets. The orchestrator does review-gat
 
 This is not a replacement for product docs. Promote repeated runbooks into docs or skills during weekly review.
 
-## 6. Optional CFS pack
+## 6. Autonomy ladder
+
+Use the smallest loop that gives the needed autonomy:
+
+| Level | What the agent owns | Required stop condition |
+|---|---|---|
+| Turn | Verification of one task | Evidence or blocker |
+| Goal | Whether DoD is reached | Independent evaluator, attempt/no-progress cap |
+| Time | Trigger on a schedule | Idempotency key and concurrency cap |
+| Proactive | Trigger and prompt | Kill switch, bounded pilot, independent review |
+
+No loop may write outside its scope, continue after repeated identical failures or claim completion without its evidence oracle.
+
+## 7. Optional CFS pack
 
 The CFS pack adds two reusable operational loops:
 

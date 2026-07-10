@@ -21,6 +21,13 @@
       "description": "Create a compact handoff with goal, state, files, verification and next steps.",
       "bundled": false,
       "allowedRoles": ["compose", "docs-writer", "general"]
+    },
+    {
+      "id": "autonomous-work-loop",
+      "displayName": "Autonomous Work Loop",
+      "description": "Apply bounded turn, goal, time or proactive loops with explicit evidence and stop conditions.",
+      "bundled": false,
+      "allowedRoles": ["compose", "plan", "review", "general"]
     }
   ]
 }

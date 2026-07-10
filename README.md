@@ -5,6 +5,7 @@ Shareable workflow template for running an engineering workspace with three coop
 - **Claude Code** — interactive orchestration, hooks, skill routing, daily/status memory.
 - **Scaffold / prime** — structured clarification → diagnosis → plan → approval → build/review loop.
 - **Codex Delegate** — routine implementation in a sandbox/worktree, accepted only through review-gate.
+- **Autonomy ladder** — bounded turn, goal, time and proactive loops with explicit evidence and stop conditions.
 
 The default install is domain-neutral. Optional packs add reusable domain workflows without secrets or private data.
 
@@ -49,6 +50,14 @@ After applying, open the target project in Claude Code or Scaffold and read:
 2. `AGENTS.md`
 3. `.scaffold/context.md`
 4. `.scaffold/rules.md`
+
+For MCP sync with Codex, install the transport explicitly after applying the kit:
+
+```bash
+scripts/dev/setup-codex-mcp.sh --scope user
+```
+
+This registers only `codex mcp-server`; it does not copy credentials or modify sandbox profiles.
 
 Then customize placeholders marked `TODO:`.
 

@@ -1,12 +1,12 @@
-#!/bin/bash
-# Hardened wrapper for Codex CLI one-shot runs.
-set -u
+#!/usr/bin/env bash
+# Bounded Codex CLI wrapper for one delegated task.
+set -euo pipefail
 
 DIR=""
 OUT=""
 SANDBOX="read-only"
 EFFORT="high"
-MODEL="gpt-5.5"
+MODEL="gpt-5.6-luna"
 
 while getopts "C:o:s:e:m:" opt; do
   case "$opt" in
@@ -23,19 +23,9 @@ shift $((OPTIND - 1))
 PROMPT="${1:?prompt required}"
 : "${DIR:?-C dir required}"
 : "${OUT:?-o outfile required}"
+CODEX_BIN="${CODEX_BIN:-${CODEX_COPILOT_BIN:-codex}}"
 
-CODEX_BIN="${CODEX_COPILOT_BIN:-$HOME/.local/bin/codex}"
+command -v "$CODEX_BIN" >/dev/null 2>&1 || { echo "Codex CLI not found: $CODEX_BIN" >&2; exit 1; }
 
-run_once() {
-  "$CODEX_BIN" -c mcp_servers='{}' -c model_reasoning_effort="$EFFORT" -m "$MODEL" \
-    exec --sandbox "$SANDBOX" -C "$DIR" "$PROMPT" > "$OUT" 2>&1
-}
-
-run_once
-RC=$?
-if [ $RC -ne 0 ] && grep -q "Reconnecting\|stream disconnected" "$OUT" 2>/dev/null; then
-  echo "[codex-exec] transient disconnect detected, retrying once..." >&2
-  run_once
-  RC=$?
-fi
-exit $RC
+"$CODEX_BIN" -a never -c mcp_servers='{}' -c model_reasoning_effort="$EFFORT" -m "$MODEL" \
+  exec --sandbox "$SANDBOX" -o "$OUT" -C "$DIR" "$PROMPT"

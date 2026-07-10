@@ -21,7 +21,9 @@ These instructions apply to coding agents in this repository.
 
 - Use `.claude/skills/codex-delegate/SKILL.md` for delegated execution work.
 - Delegated Codex never commits, pushes, rebases or resets.
-- Include `TASK`, `TASK TYPE`, `BASE SHA`, `ALLOWED PATHS`, `RELEVANT MEMORY`, `DOD` and `FORBIDDEN` in task envelopes.
+- Include `CODEX PROFILE`, `TRACKS`, `TASK`, `TASK TYPE`, `BASE SHA`, `ALLOWED PATHS`, `RELEVANT MEMORY`, `DOD` and `FORBIDDEN` in task envelopes.
+- Route strategy to Prime (Sol/xhigh), plans/review to Terra/high, important build to Luna/high and narrow tasks to Luna/medium.
+- If a writer finds ambiguity, it returns `SPEC GAP` and stops instead of inventing a requirement.
 - The orchestrator accepts delegated work only through review-gate: diff vs plan, allowed paths, DoD, tests/linters and known risks.
 
 ## Security

@@ -66,6 +66,8 @@ done
 
 copy_one "$KIT_ROOT/scripts/codex-exec.sh" "$TARGET/scripts/dev/codex-exec.sh"
 chmod +x "$TARGET/scripts/dev/codex-exec.sh"
+copy_one "$KIT_ROOT/scripts/setup-codex-mcp.sh" "$TARGET/scripts/dev/setup-codex-mcp.sh"
+chmod +x "$TARGET/scripts/dev/setup-codex-mcp.sh"
 
 mkdir -p "$TARGET/dev/daily" "$TARGET/dev/codex-tasks"
 touch "$TARGET/dev/daily/.gitkeep" "$TARGET/dev/codex-tasks/.gitkeep"

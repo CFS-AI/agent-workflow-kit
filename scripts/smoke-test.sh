@@ -38,6 +38,7 @@ required=(
   ".scaffold/done-criteria.md"
   ".scaffold/skills/catalog.json"
   "scripts/dev/codex-exec.sh"
+  "scripts/dev/setup-codex-mcp.sh"
   "dev/status.md"
 )
 
@@ -68,6 +69,10 @@ node -e "JSON.parse(require('fs').readFileSync('$DEMO/project/.scaffold/skills/c
 
 chmod +x "$DEMO/project/.claude/hooks/session-start.sh" "$DEMO/project/scripts/dev/codex-exec.sh"
 bash "$DEMO/project/.claude/hooks/session-start.sh" >/tmp/agent-workflow-session-start.log
+bash "$DEMO/project/scripts/dev/setup-codex-mcp.sh" --help >/tmp/agent-workflow-codex-mcp-help.log
+grep -q 'gpt-5.6-luna' "$DEMO/project/scripts/dev/codex-exec.sh"
+grep -q 'gpt-5.6-sol' "$DEMO/project/.claude/skills/codex-delegate/SKILL.md"
+grep -q 'autonomous-work-loop' "$DEMO/project/.scaffold/skills/catalog.json"
 
 "$ROOT/scripts/scrub-check.sh"
 
