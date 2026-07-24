@@ -2,7 +2,7 @@
 # Install Agent Workflow Kit and optionally configure OpenCode's Fable agent.
 set -euo pipefail
 
-REPOSITORY="${AGENT_WORKFLOW_REPOSITORY:-https://github.com/CFS-AI/agent-workflow-kit.git}"
+REPOSITORY="${AGENT_WORKFLOW_REPOSITORY:-https://github.com/Baggrisha/agent-workflow-kit.git}"
 REF="${AGENT_WORKFLOW_REF:-main}"
 FABLE_MODEL="${FABLE_MODEL:-}"
 FABLE_VARIANT="${FABLE_VARIANT:-high}"
