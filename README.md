@@ -44,6 +44,27 @@ cd agent-workflow-kit
 ./scripts/apply-kit.sh --pack cfs /path/to/your/project
 ```
 
+## One-command install
+
+Install the kit into an existing Git project and choose models for the Fable
+and Claude agents:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CFS-AI/agent-workflow-kit/main/scripts/install.sh | bash -s -- /path/to/your/project
+```
+
+Choose `GPT-5.6 Sol`, provide a custom OpenCode `provider/model` ID for a GPT,
+Gemini, or other provider, or keep either current agent unchanged. For
+non-interactive installs, make changes explicit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CFS-AI/agent-workflow-kit/main/scripts/install.sh | bash -s -- --fable-model openai/gpt-5.6-sol --fable-variant high --claude-model google/gemini-2.5-pro --claude-variant high /path/to/your/project
+```
+
+Use `--fable-model keep` or `--claude-model keep` to leave either existing
+configuration unchanged. The installer backs up an existing agent file before
+replacing it. Restart OpenCode after installation.
+
 After applying, open the target project in Claude Code or Scaffold and read:
 
 1. `CLAUDE.md`

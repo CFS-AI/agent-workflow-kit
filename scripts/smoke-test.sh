@@ -75,5 +75,7 @@ grep -q 'gpt-5.6-sol' "$DEMO/project/.claude/skills/codex-delegate/SKILL.md"
 grep -q 'autonomous-work-loop' "$DEMO/project/.scaffold/skills/catalog.json"
 
 "$ROOT/scripts/scrub-check.sh"
+bash -n "$ROOT/scripts/install.sh"
+"$ROOT/scripts/install.sh" --help >/tmp/agent-workflow-install-help.log
 
 echo "smoke-test: OK ($DEMO/project)"
