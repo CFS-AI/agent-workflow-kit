@@ -1,0 +1,7 @@
+name: Rules
+
+on: [pull_request]
+
+jobs:
+  rules:
+    uses: CFS-AI/cfs-harness/.github/workflows/rules-sync.yml@main
