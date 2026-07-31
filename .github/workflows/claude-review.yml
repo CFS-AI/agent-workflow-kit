@@ -1,0 +1,14 @@
+name: Claude Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  review:
+    uses: CFS-AI/cfs-harness/.github/workflows/claude-review.yml@main
+    secrets: inherit
