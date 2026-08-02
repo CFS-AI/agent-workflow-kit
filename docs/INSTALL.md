@@ -69,6 +69,16 @@ For CFS pack validation:
 AGENT_WORKFLOW_SMOKE_PACKS=cfs ./scripts/smoke-test.sh
 ```
 
-## Updating a project
+## Re-running the installer
 
-Re-run `apply-kit.sh` into a temporary directory and diff manually. Do not blindly overwrite project-specific rules.
+Re-running `apply-kit.sh` with the same arguments is a no-op. Existing files are
+left alone, and the CFS pack no longer re-merges its skill hints once its skills
+are already present — so a skill you removed in step 3 above stays removed.
+
+`scripts/smoke-test.sh` enforces this: it applies the kit, hand-edits `CLAUDE.md`,
+removes a pack skill hint, applies again, and fails if anything in the target
+changed. Without that test the guarantee was false — the pack merge used to put
+removed hints back on every run.
+
+To pick up kit changes deliberately, pass `--force` — it overwrites, including
+your edits. Diff first.
