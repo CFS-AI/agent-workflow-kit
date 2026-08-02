@@ -82,36 +82,62 @@ grep -q 'autonomous-work-loop' "$DEMO/project/.scaffold/skills/catalog.json"
 # use — and the next run silently put them back. A test that applies the kit
 # once can never catch that.
 
-printf '\n<!-- personal edit, must survive a re-run -->\n' >> "$DEMO/project/CLAUDE.md"
+apply_again() {
+  if [ ${#APPLY_ARGS[@]} -gt 0 ]; then
+    "$ROOT/scripts/apply-kit.sh" "${APPLY_ARGS[@]}" "$DEMO/project" >"$1"
+  else
+    "$ROOT/scripts/apply-kit.sh" "$DEMO/project" >"$1"
+  fi
+}
 
-if [[ ",${AGENT_WORKFLOW_SMOKE_PACKS:-}," == *",cfs,"* ]]; then
-  node -e '
-    const fs = require("fs");
-    const p = process.argv[1];
-    const doc = JSON.parse(fs.readFileSync(p, "utf8"));
-    doc.rules = doc.rules.filter((r) => r.skill !== "cfs-hub-ops");
-    fs.writeFileSync(p, JSON.stringify(doc, null, 2) + "\n");
-  ' "$DEMO/project/.claude/skills/skill-rules.json"
-fi
+# Phase A — a plain re-run must be a no-op, down to file modes.
+printf '\n<!-- personal edit, must survive a re-run -->\n' >> "$DEMO/project/CLAUDE.md"
+chmod -x "$DEMO/project/.claude/hooks/session-start.sh"
 
 cp -R "$DEMO/project" "$DEMO/before-second-run"
-
-if [ ${#APPLY_ARGS[@]} -gt 0 ]; then
-  "$ROOT/scripts/apply-kit.sh" "${APPLY_ARGS[@]}" "$DEMO/project" >/tmp/agent-workflow-apply-2.log
-else
-  "$ROOT/scripts/apply-kit.sh" "$DEMO/project" >/tmp/agent-workflow-apply-2.log
-fi
+apply_again /tmp/agent-workflow-apply-2.log
 
 if ! diff -r "$DEMO/before-second-run" "$DEMO/project"; then
   echo "re-running apply-kit.sh changed the target — personal edits are not safe" >&2
   exit 1
 fi
 
+# diff -r compares content only. An executable bit the developer cleared is a
+# personal setting too, and restoring it is invisible to every content check.
+if [ -x "$DEMO/project/.claude/hooks/session-start.sh" ]; then
+  echo "re-run restored an executable bit the developer had cleared" >&2
+  exit 1
+fi
+
+# Phase B — repairing a partially installed pack must restore the missing file
+# and nothing else. Merging hints for every pack skill whenever any one of them
+# is written would resurrect a hint the developer deleted.
 if [[ ",${AGENT_WORKFLOW_SMOKE_PACKS:-}," == *",cfs,"* ]]; then
-  if grep -q 'cfs-hub-ops' "$DEMO/project/.claude/skills/skill-rules.json"; then
-    echo "re-run resurrected a skill hint the developer had removed" >&2
+  node -e '
+    const fs = require("fs");
+    const [rulesPath, catalogPath] = process.argv.slice(1);
+    const rules = JSON.parse(fs.readFileSync(rulesPath, "utf8"));
+    rules.rules = rules.rules.filter((r) => r.skill !== "cfs-hub-ops");
+    fs.writeFileSync(rulesPath, JSON.stringify(rules, null, 2) + "\n");
+    const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+    catalog.skills = catalog.skills.filter((s) => s.id !== "cfs-hub-ops");
+    fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2) + "\n");
+  ' "$DEMO/project/.claude/skills/skill-rules.json" "$DEMO/project/.scaffold/skills/catalog.json"
+
+  rm "$DEMO/project/.scaffold/skills/cfs-docs-update.md"
+  apply_again /tmp/agent-workflow-apply-3.log
+
+  test -e "$DEMO/project/.scaffold/skills/cfs-docs-update.md" || {
+    echo "re-run did not restore a missing pack file" >&2
     exit 1
-  fi
+  }
+  for removed in "$DEMO/project/.claude/skills/skill-rules.json" \
+                 "$DEMO/project/.scaffold/skills/catalog.json"; do
+    if grep -q 'cfs-hub-ops' "$removed"; then
+      echo "repairing the pack resurrected a hint the developer had removed: $removed" >&2
+      exit 1
+    fi
+  done
 fi
 
 "$ROOT/scripts/scrub-check.sh"
