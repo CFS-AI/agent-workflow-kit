@@ -33,8 +33,13 @@ const RESERVATION_LOCK_STALE_DEFAULT_MS = 5_000;
  * the default is three orders of magnitude of headroom, not a tuning knob.
  */
 function staleAfterMs(env = process.env) {
-  const value = Number(env.AGENT_KIT_LEDGER_STALE_MS);
-  return Number.isFinite(value) && value >= 0 ? value : RESERVATION_LOCK_STALE_DEFAULT_MS;
+  // `Number("")` is 0, and 0 means every lease is instantly reclaimable — so an
+  // `export AGENT_KIT_LEDGER_STALE_MS=` with nothing after it silently turned the
+  // mutual exclusion off. A blank value is an unset one; an explicit 0 still means 0,
+  // because the suite drives the reclaim path with it.
+  const raw = String(env.AGENT_KIT_LEDGER_STALE_MS ?? "").trim();
+  const value = Number(raw);
+  return raw !== "" && Number.isFinite(value) && value >= 0 ? value : RESERVATION_LOCK_STALE_DEFAULT_MS;
 }
 
 function sleepSync(ms) {

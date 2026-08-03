@@ -133,6 +133,32 @@ test("the ceiling holds even when every lease is instantly reclaimable", async (
   }
 });
 
+test("a blank stale window is an unset one, not an instantly reclaimable lease", async () => {
+  // `Number("")` is 0, so `export AGENT_KIT_LEDGER_STALE_MS=` with nothing after it read
+  // as "every lease is already stale" and turned the mutual exclusion off entirely.
+  const blank = tempLedger();
+  const results = await Promise.all(
+    Array.from({ length: 4 }, () => reserveInChild(blank, 3, 5, { AGENT_KIT_LEDGER_STALE_MS: "" })),
+  );
+  assert.equal(results.filter((result) => result.ok).length, 1);
+  assert.equal(readSpentUsd(blank), 3);
+
+  // A lock left behind by a holder that died: an explicit 0 must still reclaim it, and
+  // the blank value must behave like the default and refuse to.
+  const zeroFile = tempLedger();
+  fs.mkdirSync(path.dirname(zeroFile), { recursive: true });
+  fs.writeFileSync(`${zeroFile}.reservation-lock`, "a-holder-that-died");
+  const reclaimed = await reserveInChild(zeroFile, 1, 5, { AGENT_KIT_LEDGER_STALE_MS: "0" });
+  assert.equal(reclaimed.ok, true, "an explicit zero window still reclaims an abandoned lease");
+
+  const blankFile = tempLedger();
+  fs.mkdirSync(path.dirname(blankFile), { recursive: true });
+  fs.writeFileSync(`${blankFile}.reservation-lock`, "a-holder-that-died");
+  const waited = await reserveInChild(blankFile, 1, 5, { AGENT_KIT_LEDGER_STALE_MS: "" });
+  assert.equal(waited.ok, false, "a blank window waits out the default instead of reclaiming");
+  assert.match(waited.reason, /busy/);
+});
+
 test("a lease lost across the write leaves no money reserved", () => {
   // Checking ownership before the append left the append itself unguarded: a holder
   // descheduled between those two lines still lands a reservation the reclaimer's read
