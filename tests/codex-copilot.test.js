@@ -2,12 +2,136 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 
 const {
   PROFILES,
+  askCodex,
   choosePlanningProfile,
   isCircuitOpen,
+  main,
 } = require("../templates/claude/hooks/codex-copilot.js");
+const { readSpentUsd } = require("../templates/claude/hooks/ledger.js");
+
+const PAID_ENV = {
+  AGENT_KIT_PROVIDER: "deepseek",
+  AGENT_KIT_BUDGET_USD: "5",
+  AGENT_KIT_MODEL_PRICES: '{"deepseek-reasoner":{"in":0.55,"out":2.19}}',
+  DEEPSEEK_API_KEY: "test-key",
+  AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1",
+};
+
+function withProjectRoot(fn) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-kit-hook-"));
+  const previous = process.env.CLAUDE_PROJECT_DIR;
+  process.env.CLAUDE_PROJECT_DIR = root;
+  return Promise.resolve(fn(path.join(root, ".claude", "cache", "provider-spend.jsonl")))
+    .finally(() => {
+      if (previous === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+      else process.env.CLAUDE_PROJECT_DIR = previous;
+    });
+}
+
+// main() takes no injected transport, so the reviewer is stubbed where the hook looks
+// for it: the Codex binary itself. That also covers the wiring between the two.
+function withStubbedCodex(verdict, mode, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-kit-bin-"));
+  const bin = path.join(dir, "codex-stub");
+  fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(verdict)}\n`);
+  fs.chmodSync(bin, 0o755);
+  const previous = { bin: process.env.CODEX_COPILOT_BIN, mode: process.env.CODEX_COPILOT_MODE };
+  process.env.CODEX_COPILOT_BIN = bin;
+  process.env.CODEX_COPILOT_MODE = mode;
+  const restore = (key, value) => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
+  return Promise.resolve(fn()).finally(() => {
+    restore("CODEX_COPILOT_BIN", previous.bin);
+    restore("CODEX_COPILOT_MODE", previous.mode);
+  });
+}
+
+const RISKY_CALL = {
+  hook_event_name: "PreToolUse",
+  tool_name: "Bash",
+  tool_input: { command: "rm -rf /var/tmp/agent-kit-not-real" },
+};
+
+test("strict mode denies the tool call in the shape the host enforces", async () => {
+  // A detail-less `BLOCK` is what a model returns when asked for one line, and it is
+  // the shape that used to slip past enforcement while parsing accepted it.
+  //
+  // The assertion is on the wire format, not on an invented one. The hook emitted
+  // `decision: "deny"`, which the host's schema rejects — its enum is approve/block —
+  // and rejected output is discarded whole, so every denial was inert while this test
+  // passed against a shape nothing consumes.
+  await withProjectRoot(() => withStubbedCodex("BLOCK", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /BLOCK/);
+    assert.equal(output.decision, "block", "the legacy field must carry a value the host knows");
+  }));
+
+  await withProjectRoot(() => withStubbedCodex("**BLOCK** — force push to main", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  }));
+
+  // Every word a model denies with, not only the one token the gate used to know.
+  for (const said of ["BLOCKED: this deletes the live database", "Verdict: BLOCKED", "DENY: unreviewable"]) {
+    await withProjectRoot(() => withStubbedCodex(said, "strict", async () => {
+      const output = await main(RISKY_CALL);
+      assert.equal(output.hookSpecificOutput.permissionDecision, "deny", said);
+    }));
+  }
+});
+
+test("in strict mode a review that reached no verdict denies too", async () => {
+  // Allowing here meant every way the reviewer could fail — no verdict, no binary, a
+  // timeout, an open circuit — removed the gate from `rm -rf` at the moment it mattered.
+  await withProjectRoot(() => withStubbedCodex("I would not run that, honestly.", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /no APPROVE\/WARN\/BLOCK verdict/);
+  }));
+});
+
+test("strict mode still denies once the verdict has been escalated", async () => {
+  // The hook composed `BLOCK [escalated from deepseek: …]` for display and then re-parsed
+  // that same string to decide. The bracketed suffix broke the match, so every escalated
+  // denial stopped denying — and a misconfigured paid provider escalates on every call.
+  await withProjectRoot(async () => {
+    const { note, blocking } = await askCodex("tool-check", "rm -rf /srv", "review", 20, {
+      // No ceiling, so the paid provider is refused before any request and escalates.
+      env: { AGENT_KIT_PROVIDER_REVIEW: "deepseek", AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+      // A bare `BLOCK` is what a model returns when asked for one line, and it is the
+      // shape the bracketed suffix used to hide.
+      spawnSync: () => ({ status: 0, stdout: "BLOCK", stderr: "" }),
+    });
+
+    assert.match(note, /escalated from deepseek/);
+    assert.equal(blocking, true);
+  });
+});
+
+test("strict mode is not a blanket deny", async () => {
+  await withProjectRoot(() => withStubbedCodex("APPROVE: scoped to a temp path", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.decision, undefined);
+    assert.match(output.hookSpecificOutput.additionalContext, /APPROVE/);
+  }));
+});
+
+test("outside strict mode a BLOCK advises instead of denying", async () => {
+  await withProjectRoot(() => withStubbedCodex("BLOCK", "advisory", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.decision, undefined);
+    assert.match(output.hookSpecificOutput.additionalContext, /BLOCK/);
+  }));
+});
 
 test("maps GPT-5.6 profiles by responsibility", () => {
   assert.deepEqual(PROFILES.prime, { model: "gpt-5.6-sol", effort: "xhigh" });
@@ -26,4 +150,175 @@ test("opens the circuit only after repeated recent failures", () => {
   const now = 1_000_000;
   assert.equal(isCircuitOpen({ failures: [now - 1000, now - 2000, now - 3000] }, now), true);
   assert.equal(isCircuitOpen({ failures: [now - 1000, now - 400_000, now - 500_000] }, now), false);
+});
+
+test("what a metered call cost lands in the spend ledger", async () => {
+  await withProjectRoot(async (ledgerFile) => {
+    const note = await askCodex("tool-check", "check this", "review", 20, {
+      env: PAID_ENV,
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "APPROVE: nothing risky here" } }],
+          usage: { prompt_tokens: 1_000_000, completion_tokens: 0 },
+        }),
+      }),
+    });
+
+    assert.deepEqual(note, { note: "APPROVE: nothing risky here", blocking: false, conclusive: true });
+    assert.equal(readSpentUsd(ledgerFile).toFixed(2), "0.55");
+  });
+});
+
+test("the ledger stops the routine before the ceiling is crossed, not after", async () => {
+  await withProjectRoot(async (ledgerFile) => {
+    let calls = 0;
+    const deps = {
+      // A million-token cap at $2.19/M is $2.19 of exposure per call.
+      env: { ...PAID_ENV, AGENT_KIT_MAX_TOKENS: "1000000" },
+      spawnSync: () => ({ status: 0, stdout: "APPROVE: codex answered", stderr: "" }),
+      fetch: async () => {
+        calls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [{ message: { content: "APPROVE: nothing risky here" } }],
+            usage: { prompt_tokens: 0, completion_tokens: 1_000_000 },
+          }),
+        };
+      },
+    };
+
+    for (let i = 0; i < 5; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+
+    // Two calls fit under $5; a third would land at $6.57, so it is never made.
+    assert.equal(calls, 2);
+    assert.equal(readSpentUsd(ledgerFile).toFixed(2), "4.38");
+    assert.ok(readSpentUsd(ledgerFile) <= 5);
+  });
+});
+
+test("a chatty paid provider does not close the breaker on the subscription reviewer", async () => {
+  // The breaker counts transport failures. Counting "answered without a verdict" too let
+  // one talkative vendor on one profile disable review for every profile for five
+  // minutes — including the profiles still on Codex.
+  await withProjectRoot(async () => {
+    const deps = {
+      env: PAID_ENV,
+      spawnSync: () => ({ status: 0, stdout: "BLOCK: destroys uncommitted work", stderr: "" }),
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "Sure, that seems okay." } }],
+          usage: { prompt_tokens: 10, completion_tokens: 10 },
+        }),
+      }),
+    };
+
+    for (let i = 0; i < 4; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+
+    // The fifth call still reaches a reviewer rather than a skipped-circuit notice.
+    const { note, blocking } = await askCodex("tool-check", "check this", "review", 20, deps);
+    assert.doesNotMatch(note, /circuit is open/);
+    assert.equal(blocking, true);
+  });
+});
+
+test("a dead paid transport stops being dialled, while Codex keeps reviewing", async () => {
+  // The other half of the same rule, and the half the test above never reached: the
+  // count is kept per provider, so a paid route whose transport is down is skipped
+  // after three failures instead of being retried on every hook — and skipping it does
+  // not take the subscription reviewer down with it.
+  await withProjectRoot(async () => {
+    let attempts = 0;
+    const deps = {
+      env: PAID_ENV,
+      spawnSync: () => ({ status: 0, stdout: "BLOCK: destroys uncommitted work", stderr: "" }),
+      fetch: async () => { attempts += 1; throw new Error("connect ECONNREFUSED"); },
+    };
+
+    for (let i = 0; i < 3; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+    assert.equal(attempts, 3, "the paid transport is tried until the breaker has seen enough");
+
+    const { note, blocking } = await askCodex("tool-check", "check this", "review", 20, deps);
+    assert.equal(attempts, 3, "and is not dialled again inside the window");
+    assert.match(note, /failed state/);
+    assert.doesNotMatch(note, /circuit is open/, "the subscription reviewer is still up");
+    assert.equal(blocking, true, "and its verdict still decides");
+  });
+});
+
+test("a settlement that crosses the ceiling is reported, not swallowed", async () => {
+  // The reservation bounds output at AGENT_KIT_MAX_TOKENS, which is a request, not a
+  // promise. A longer answer is already paid for by the time it lands, so it is said out
+  // loud instead of quietly appended.
+  await withProjectRoot(async (ledgerFile) => {
+    const { note } = await askCodex("tool-check", "check this", "review", 20, {
+      env: { ...PAID_ENV, AGENT_KIT_BUDGET_USD: "0.002", AGENT_KIT_MAX_TOKENS: "512" },
+      spawnSync: () => ({ status: 0, stdout: "APPROVE: codex answered", stderr: "" }),
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "APPROVE: fine" } }],
+          usage: { prompt_tokens: 0, completion_tokens: 6000 },
+        }),
+      }),
+    });
+
+    assert.match(note, /budget ceiling crossed on settlement/);
+    assert.ok(readSpentUsd(ledgerFile) > 0.002);
+  });
+});
+
+test("a provider that reports zero tokens cannot buy unlimited calls for $0", async () => {
+  await withProjectRoot(async (ledgerFile) => {
+    let calls = 0;
+    const deps = {
+      env: { ...PAID_ENV, AGENT_KIT_MAX_TOKENS: "1000000" },
+      spawnSync: () => ({ status: 0, stdout: "APPROVE: codex answered", stderr: "" }),
+      fetch: async () => {
+        calls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [{ message: { content: "APPROVE: fine" } }],
+            usage: { prompt_tokens: 0, completion_tokens: 0 },
+          }),
+        };
+      },
+    };
+
+    for (let i = 0; i < 6; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+
+    assert.equal(calls, 2);
+    assert.ok(readSpentUsd(ledgerFile) > 0);
+  });
+});
+
+test("a provider that omits usage cannot buy unlimited calls for $0", async () => {
+  await withProjectRoot(async (ledgerFile) => {
+    let calls = 0;
+    const deps = {
+      env: { ...PAID_ENV, AGENT_KIT_MAX_TOKENS: "1000000" },
+      spawnSync: () => ({ status: 0, stdout: "APPROVE: codex answered", stderr: "" }),
+      fetch: async () => {
+        calls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ choices: [{ message: { content: "APPROVE: fine" } }] }),
+        };
+      },
+    };
+
+    for (let i = 0; i < 6; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+
+    assert.equal(calls, 2);
+    assert.ok(readSpentUsd(ledgerFile) > 0);
+  });
 });

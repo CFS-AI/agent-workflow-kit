@@ -112,6 +112,25 @@ fi
 
 copy_one "$KIT_ROOT/.scrub-denylist" "$TARGET/.scrub-denylist"
 
+# The hooks keep circuit-breaker state and the provider spend ledger under
+# .claude/cache/. A committed ledger leaks how the workspace is used, and a merged
+# one silently resets the budget ceiling, so the ignore is part of the install.
+ensure_ignored() {
+  local pattern="$1"
+  local file="$TARGET/.gitignore"
+  if [ -e "$file" ] && grep -qxF "$pattern" "$file"; then
+    echo "skip existing: .gitignore ($pattern)"
+    return
+  fi
+  if [ -e "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+    echo "" >> "$file"
+  fi
+  echo "$pattern" >> "$file"
+  echo "write: .gitignore ($pattern)"
+}
+
+ensure_ignored ".claude/cache/"
+
 # merge_cfs_json <skill-id>... — add hints for exactly the named skills.
 #
 # The skill list is an argument, not a constant, because the two pack skills are

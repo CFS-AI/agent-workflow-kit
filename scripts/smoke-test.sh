@@ -31,6 +31,8 @@ required=(
   ".claude/hooks/session-checkpoint.js"
   ".claude/hooks/skill-activation.js"
   ".claude/hooks/codex-copilot.js"
+  ".claude/hooks/providers.js"
+  ".claude/hooks/ledger.js"
   ".claude/skills/codex-delegate/SKILL.md"
   ".scaffold/context.md"
   ".scaffold/rules.md"
@@ -71,6 +73,16 @@ chmod +x "$DEMO/project/.claude/hooks/session-start.sh" "$DEMO/project/scripts/d
 bash "$DEMO/project/.claude/hooks/session-start.sh" >/tmp/agent-workflow-session-start.log
 bash "$DEMO/project/scripts/dev/setup-codex-mcp.sh" --help >/tmp/agent-workflow-codex-mcp-help.log
 grep -q 'gpt-5.6-luna' "$DEMO/project/scripts/dev/codex-exec.sh"
+# An installed workspace must route to the subscription transport until someone
+# names a paid provider on purpose.
+node -e "
+  const p = require('$DEMO/project/.claude/hooks/providers.js');
+  if (p.resolveProvider('review', {}) !== 'codex') { console.error('default routing is not codex'); process.exit(1); }
+"
+# A spend ledger must never become a commit.
+grep -qxF '.claude/cache/' "$DEMO/project/.gitignore"
+"$ROOT/scripts/apply-kit.sh" "$DEMO/project" >>/tmp/agent-workflow-apply.log
+test "$(grep -cxF '.claude/cache/' "$DEMO/project/.gitignore")" = "1"
 grep -q 'gpt-5.6-sol' "$DEMO/project/.claude/skills/codex-delegate/SKILL.md"
 grep -q 'autonomous-work-loop' "$DEMO/project/.scaffold/skills/catalog.json"
 
