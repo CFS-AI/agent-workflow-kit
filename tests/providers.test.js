@@ -92,6 +92,26 @@ test("a prototype property name cannot reach the paid transport either", async (
   }
 });
 
+test("a paid route needs an explicit acknowledgement before prompt text can leave the machine", async () => {
+  let called = false;
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "contains a repository path and an incident detail",
+    { provider: "deepseek", profile: "review" },
+    {
+      env: PAID_ENV,
+      spawnSync: codexOk,
+      fetch: async () => { called = true; throw new Error("must not be called"); },
+    },
+  );
+
+  assert.equal(called, false);
+  assert.equal(result.provider, "codex");
+  assert.equal(result.escalatedFrom, "deepseek");
+  assert.match(result.escalationReason, /ALLOW_EXTERNAL_PROMPTS/);
+});
+
 test("prose is not a verdict", () => {
   assert.deepEqual(parseVerdict("BLOCK: force push to main"), {
     ok: true,
@@ -147,9 +167,38 @@ test("an unpriced model costs unknown, not zero", () => {
   assert.equal(priced, 0.27 + 1.1);
 });
 
+test("malformed or negative prices cannot make a paid call look affordable", async () => {
+  for (const prices of [
+    '{"deepseek-reasoner":{"in":-1,"out":-1}}',
+    '{"deepseek-reasoner":{"in":"not-a-number","out":2}}',
+    '{"deepseek-reasoner":{"in":0,"out":0}}',
+  ]) {
+    let called = false;
+    const result = await askProvider(
+      "tool-check",
+      ROUTE,
+      "check this",
+      { provider: "deepseek", profile: "review", spentUsd: 4.99 },
+      {
+        env: {
+          ...PAID_ENV,
+          AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1",
+          AGENT_KIT_MODEL_PRICES: prices,
+        },
+        spawnSync: codexOk,
+        fetch: async () => { called = true; throw new Error("must not be called"); },
+      },
+    );
+
+    assert.equal(called, false);
+    assert.equal(result.provider, "codex");
+    assert.match(result.escalationReason, /valid declared price/);
+  }
+});
+
 test("a metered call is refused without a ceiling, without a price, or once spent", () => {
   assert.match(checkBudget("deepseek-chat", 0, { AGENT_KIT_MODEL_PRICES: PRICES }).reason, /ceiling not set/);
-  assert.match(checkBudget("deepseek-chat", 0, { AGENT_KIT_BUDGET_USD: "5" }).reason, /no declared price/);
+  assert.match(checkBudget("deepseek-chat", 0, { AGENT_KIT_BUDGET_USD: "5" }).reason, /no valid declared price/);
   assert.equal(checkBudget("deepseek-chat", 0, { AGENT_KIT_BUDGET_USD: "5", AGENT_KIT_MODEL_PRICES: PRICES }).ok, true);
   assert.match(
     checkBudget("deepseek-chat", 5, { AGENT_KIT_BUDGET_USD: "5", AGENT_KIT_MODEL_PRICES: PRICES }).reason,
@@ -193,7 +242,7 @@ test("the request body carries the provider's model, never the Codex route name"
     ROUTE,
     "review this plan",
     { provider: "deepseek", profile: "review" },
-    { env: PAID_ENV, fetch },
+    { env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" }, fetch },
   );
 
   assert.equal(seen.body.model, "deepseek-reasoner");
@@ -210,7 +259,7 @@ test("a response without usage is a failed metered call, never a free one", asyn
     "check this",
     { provider: "deepseek", profile: "review" },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       fetch: fakeFetch({ choices: [{ message: { content: "APPROVE: nothing risky" } }] }),
       spawnSync: codexOk,
     },
@@ -229,7 +278,7 @@ test("an empty usage block is no usage at all", async () => {
     "check this",
     { provider: "deepseek", profile: "review" },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       fetch: fakeFetch({ choices: [{ message: { content: "APPROVE: fine" } }], usage: {} }),
       spawnSync: codexOk,
     },
@@ -259,7 +308,7 @@ test("a usage block that accounts for no tokens is no usage at all", async () =>
     "check this",
     { provider: "deepseek", profile: "review" },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       fetch: fakeFetch({
         choices: [{ message: { content: "APPROVE: fine" } }],
         usage: { prompt_tokens: 0, completion_tokens: 0 },
@@ -281,7 +330,7 @@ test("a budget with less room than the call needs refuses before spending it", a
     "check this",
     { provider: "deepseek", profile: "review", spentUsd: 4.9999 },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       spawnSync: codexOk,
       fetch: async () => { called = true; throw new Error("must not be called"); },
     },
@@ -298,7 +347,14 @@ test("a missing key escalates to the unmetered provider and says so", async () =
     ROUTE,
     "check this",
     { provider: "deepseek", profile: "review" },
-    { env: { AGENT_KIT_BUDGET_USD: "5", AGENT_KIT_MODEL_PRICES: PRICES }, spawnSync: codexOk },
+    {
+      env: {
+        AGENT_KIT_BUDGET_USD: "5",
+        AGENT_KIT_MODEL_PRICES: PRICES,
+        AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1",
+      },
+      spawnSync: codexOk,
+    },
   );
 
   assert.equal(result.ok, true);
@@ -315,7 +371,12 @@ test("an exhausted budget escalates before any request is made", async () => {
     "check this",
     { provider: "deepseek", profile: "review", spentUsd: 99 },
     {
-      env: { AGENT_KIT_BUDGET_USD: "5", AGENT_KIT_MODEL_PRICES: PRICES, DEEPSEEK_API_KEY: "unused" },
+      env: {
+        AGENT_KIT_BUDGET_USD: "5",
+        AGENT_KIT_MODEL_PRICES: PRICES,
+        DEEPSEEK_API_KEY: "unused",
+        AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1",
+      },
       spawnSync: codexOk,
       fetch: async () => { called = true; throw new Error("must not be called"); },
     },
@@ -333,7 +394,7 @@ test("a healthy metered call returns the verdict and what it cost", async () => 
     "review this plan",
     { provider: "deepseek", profile: "simple" },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       fetch: fakeFetch({
         choices: [{ message: { content: "APPROVE: plan is bounded" } }],
         usage: { prompt_tokens: 1_000_000, completion_tokens: 0 },
@@ -354,7 +415,7 @@ test("prose from a paid provider is a failed call, never a quiet APPROVE", async
     "check this",
     { provider: "deepseek", profile: "review" },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       fetch: fakeFetch({
         choices: [{ message: { content: "Sure, that looks fine to me." } }],
         usage: { prompt_tokens: 10, completion_tokens: 10 },
@@ -375,7 +436,7 @@ test("an HTTP failure falls back instead of failing the turn", async () => {
     "check this",
     { provider: "deepseek", profile: "review" },
     {
-      env: PAID_ENV,
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
       fetch: fakeFetch({}, { ok: false, status: 503 }),
       spawnSync: codexOk,
     },
@@ -383,6 +444,26 @@ test("an HTTP failure falls back instead of failing the turn", async () => {
 
   assert.equal(result.provider, "codex");
   assert.match(result.escalationReason, /HTTP 503/);
+});
+
+test("transport errors are redacted before they reach the hook output", async () => {
+  const header = ["author", "ization"].join("");
+  const secret = ["definitely", "not", "for", "output"].join("-");
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    { provider: "deepseek", profile: "review" },
+    {
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+      fetch: async () => { throw new Error(`${header}: Bearer ${secret}`); },
+      spawnSync: codexOk,
+    },
+  );
+
+  assert.equal(result.provider, "codex");
+  assert.match(result.escalationReason, new RegExp(`${header}: Bearer <REDACTED>`, "i"));
+  assert.doesNotMatch(result.escalationReason, new RegExp(secret));
 });
 
 test("the unmetered provider has nowhere to escalate and reports plainly", async () => {

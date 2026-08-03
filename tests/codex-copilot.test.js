@@ -20,6 +20,7 @@ const PAID_ENV = {
   AGENT_KIT_BUDGET_USD: "5",
   AGENT_KIT_MODEL_PRICES: '{"deepseek-reasoner":{"in":0.55,"out":2.19}}',
   DEEPSEEK_API_KEY: "test-key",
+  AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1",
 };
 
 function withProjectRoot(fn) {

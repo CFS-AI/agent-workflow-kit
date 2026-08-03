@@ -60,9 +60,6 @@ const VERDICT_SEVERITY = { APPROVE: 1, WARN: 2, BLOCK: 3 };
 
 const DEFAULT_MAX_TOKENS = 512;
 
-/** Cyrillic prompts and shell commands tokenize denser than English prose. */
-const CHARS_PER_TOKEN = 2;
-
 /**
  * Names an actual provider, as opposed to a property every object has.
  *
@@ -130,6 +127,28 @@ function loadPrices(env = process.env) {
 }
 
 /**
+ * A usable metered price has two finite, non-negative components and costs something.
+ *
+ * Treat malformed numbers as unknown. Coercing a negative or non-numeric price to
+ * zero makes the budget gate permissive precisely when its accounting is unreliable.
+ */
+function priceFor(model, prices) {
+  const raw = prices[model];
+  if (!raw || typeof raw !== "object") return null;
+  const input = Number(raw.in);
+  const output = Number(raw.out);
+  if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0 || input + output <= 0) return null;
+  return { in: input, out: output };
+}
+
+/** Removes credential-shaped fragments before a transport error reaches hook output. */
+function safeReason(reason) {
+  return String(reason || "unknown provider error")
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1<REDACTED>")
+    .replace(/(api[_-]?key|password|secret|token)\s*[:=]\s*[^\s,;]+/gi, "$1=<REDACTED>");
+}
+
+/**
  * What a completed call cost, or `null` when that cannot be known.
  *
  * A `usage` block that accounts for no tokens is no usage at all — reading it as zero
@@ -138,7 +157,7 @@ function loadPrices(env = process.env) {
  * one: no call that reached a model consumed nothing, so zero means unmeasured.
  */
 function estimateCostUsd(model, usage, prices) {
-  const price = prices[model];
+  const price = priceFor(model, prices);
   if (!price || usage == null) return null;
   const inTok = Number(usage.prompt_tokens);
   const outTok = Number(usage.completion_tokens);
@@ -157,9 +176,11 @@ function estimateCostUsd(model, usage, prices) {
  * to bound the call in advance.
  */
 function projectedCostUsd(model, prompt, env = process.env, prices = loadPrices(env)) {
-  const price = prices[model];
+  const price = priceFor(model, prices);
   if (!price) return null;
-  const inTok = Math.ceil(String(prompt || "").length / CHARS_PER_TOKEN);
+  // A byte is a conservative upper bound for BPE tokens (unlike a characters/token
+  // heuristic, which underestimates dense code and non-ASCII text).
+  const inTok = Buffer.byteLength(String(prompt || ""), "utf8");
   return (inTok / 1e6) * Number(price.in || 0) + (maxTokens(env) / 1e6) * Number(price.out || 0);
 }
 
@@ -176,8 +197,8 @@ function checkBudget(model, spentUsd, env = process.env, projectedUsd = 0) {
   if (!ceiling) {
     return { ok: false, reason: "budget ceiling not set (AGENT_KIT_BUDGET_USD)" };
   }
-  if (!loadPrices(env)[model]) {
-    return { ok: false, reason: `model ${model} has no declared price — spend would be unmeasurable` };
+  if (!priceFor(model, loadPrices(env))) {
+    return { ok: false, reason: `model ${model} has no valid declared price — spend would be unmeasurable` };
   }
   if (spentUsd >= ceiling) {
     return { ok: false, reason: `budget ceiling reached ($${spentUsd.toFixed(4)} of $${ceiling})` };
@@ -238,7 +259,7 @@ async function runDeepSeek(model, prompt, timeoutSec, deps = {}) {
     const text = String(body?.choices?.[0]?.message?.content || "").trim();
     return { ok: true, text, usage: body?.usage || null };
   } catch (err) {
-    return { ok: false, reason: `request failed: ${err && err.name === "AbortError" ? "timeout" : err.message}` };
+    return { ok: false, reason: `request failed: ${err && err.name === "AbortError" ? "timeout" : safeReason(err && err.message)}` };
   } finally {
     clearTimeout(timer);
   }
@@ -296,16 +317,31 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
   const provider = PROVIDERS[providerName];
   const timeoutSec = options.timeoutSec || provider.defaultTimeoutSec;
   const model = resolveModel(providerName, route, options.profile);
+  let reservedUsd = 0;
 
   const escalate = async (reason, costUsd = 0) => {
     const fallback = await askProvider(kind, route, prompt, { ...options, provider: DEFAULT_PROVIDER }, deps);
-    return { ...fallback, costUsd, escalatedFrom: providerName, escalationReason: reason };
+    return {
+      ...fallback,
+      costUsd,
+      ...(reservedUsd > 0 ? { reservedUsd } : {}),
+      escalatedFrom: providerName,
+      escalationReason: reason,
+    };
   };
 
   if (provider.metered) {
+    if (env.AGENT_KIT_ALLOW_EXTERNAL_PROMPTS !== "1") {
+      return escalate("external prompt transfer is not acknowledged (set AGENT_KIT_ALLOW_EXTERNAL_PROMPTS=1)");
+    }
     const projected = projectedCostUsd(model, prompt, env);
     const budget = checkBudget(model, Number(options.spentUsd || 0), env, projected || 0);
     if (!budget.ok) return escalate(budget.reason);
+    if (typeof options.reserveSpend === "function") {
+      const reservation = options.reserveSpend(projected, Number(env.AGENT_KIT_BUDGET_USD));
+      if (!reservation || !reservation.ok) return escalate(reservation?.reason || "paid-call reservation failed");
+      reservedUsd = Number(reservation.reservedUsd || projected);
+    }
   }
 
   const raw = providerName === "codex"
@@ -330,13 +366,27 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
       );
     }
     costUsd = measured;
+    if (reservedUsd > 0 && typeof options.settleSpend === "function") options.settleSpend(reservedUsd, costUsd);
   }
 
   const parsed = parseVerdict(raw.text);
   if (!parsed.ok) {
-    return { ok: false, provider: providerName, costUsd, verdict: `WARN: ${kind} ${parsed.reason}` };
+    return {
+      ok: false,
+      provider: providerName,
+      costUsd,
+      ...(reservedUsd > 0 ? { reservedUsd } : {}),
+      verdict: `WARN: ${kind} ${parsed.reason}`,
+    };
   }
-  return { ok: true, provider: providerName, costUsd, level: parsed.level, verdict: parsed.verdict };
+  return {
+    ok: true,
+    provider: providerName,
+    costUsd,
+    ...(reservedUsd > 0 ? { reservedUsd } : {}),
+    level: parsed.level,
+    verdict: parsed.verdict,
+  };
 }
 
 module.exports = {
@@ -349,9 +399,11 @@ module.exports = {
   loadPrices,
   maxTokens,
   parseVerdict,
+  priceFor,
   projectedCostUsd,
   resolveModel,
   resolveProvider,
   runCodex,
   runDeepSeek,
+  safeReason,
 };

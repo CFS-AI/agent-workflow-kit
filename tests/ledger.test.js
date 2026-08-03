@@ -14,7 +14,7 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 
-const { readSpentUsd, recordSpendUsd } = require("../templates/claude/hooks/ledger.js");
+const { readSpentUsd, recordSpendUsd, reserveSpendUsd } = require("../templates/claude/hooks/ledger.js");
 
 const LEDGER_MODULE = path.resolve(__dirname, "../templates/claude/hooks/ledger.js");
 
@@ -43,6 +43,24 @@ function recordInChild(file, usd, times, timeoutMs = 30_000) {
   });
 }
 
+function reserveInChild(file, usd, ceiling) {
+  const script = `
+    const { reserveSpendUsd } = require(${JSON.stringify(LEDGER_MODULE)});
+    const result = reserveSpendUsd(${JSON.stringify(file)}, ${usd}, ${ceiling});
+    process.stdout.write(JSON.stringify(result));
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "inherit"] });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code !== 0) reject(new Error(`reservation child exited ${code}`));
+      else resolve(JSON.parse(output));
+    });
+  });
+}
+
 test("an absent ledger reads as zero spend, not as an error", () => {
   assert.equal(readSpentUsd(tempLedger()), 0);
 });
@@ -64,6 +82,17 @@ test("concurrent recorders lose nothing", async () => {
 
   // 3 hooks x 40 calls x 1.37 — the ceiling only works if every one of them lands.
   assert.equal(readSpentUsd(file).toFixed(2), "164.40");
+});
+
+test("concurrent reservations cannot collectively cross the budget ceiling", async () => {
+  const file = tempLedger();
+  const results = await Promise.all([
+    reserveInChild(file, 3, 5),
+    reserveInChild(file, 3, 5),
+  ]);
+
+  assert.equal(results.filter((result) => result.ok).length, 1);
+  assert.equal(readSpentUsd(file), 3);
 });
 
 test("a stray lock directory next to the ledger cannot wedge the recorder", async () => {

@@ -97,6 +97,7 @@ repositories whose prompts and commands you are willing to disclose to that vend
 ```bash
 export AGENT_KIT_PROVIDER_REVIEW=deepseek         # move one profile, not all of them
 export DEEPSEEK_API_KEY=...                       # never committed; read at call time
+export AGENT_KIT_ALLOW_EXTERNAL_PROMPTS=1         # explicit acknowledgement of third-party prompt transfer
 export AGENT_KIT_BUDGET_USD=5                     # required — no ceiling, no metered call
 export AGENT_KIT_MODEL_PRICES='{"deepseek-reasoner":{"in":0.55,"out":2.19}}'
 export AGENT_KIT_MAX_TOKENS=512                   # optional; bounds response length and cost
@@ -117,9 +118,14 @@ Rules the layer enforces:
   silently recorded at $0 is how a budget goes blind, so the call is refused instead.
 - **No ceiling, no metered call.** `AGENT_KIT_BUDGET_USD` is required, and spend
   accrues across turns so the ceiling bounds the routine rather than one call.
+- **No explicit transfer acknowledgement, no metered call.** Set
+  `AGENT_KIT_ALLOW_EXTERNAL_PROMPTS=1` only after accepting that the raw prompt and
+  command text described above will go to the third-party provider.
 - **The ceiling is a limit, not a trigger.** A call is refused when its worst case —
   the prompt as sent, plus `AGENT_KIT_MAX_TOKENS` of output — would carry the total
-  past the ceiling, so the ceiling cannot be crossed by the call that tests it.
+  past the ceiling. The worst-case amount is atomically reserved before the request,
+  so concurrent hooks cannot cross the ceiling together; a crashed call keeps its
+  reservation conservatively rather than reopening budget that may have been spent.
 - **A response with no usable `usage` block is a failed call.** Unmeasurable spend is
   unknown, never zero: the answer is discarded and the worst case is charged. A block
   that is absent, empty, or all zeros is the same claim — no call that reached a model

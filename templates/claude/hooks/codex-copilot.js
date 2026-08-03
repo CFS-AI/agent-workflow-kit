@@ -4,7 +4,12 @@
 const fs = require("fs");
 const path = require("path");
 const { askProvider, isBlockingVerdict } = require("./providers.js");
-const { readSpentUsd, recordSpendUsd } = require("./ledger.js");
+const {
+  readSpentUsd,
+  recordSpendUsd,
+  reserveSpendUsd,
+  settleReservedSpendUsd,
+} = require("./ledger.js");
 
 const PROFILES = {
   prime: { model: "gpt-5.6-sol", effort: "xhigh" },
@@ -72,14 +77,16 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
     profile,
     timeoutSec: timeout,
     spentUsd: readSpentUsd(ledgerFile),
+    reserveSpend: (usd, ceiling) => reserveSpendUsd(ledgerFile, usd, ceiling),
+    settleSpend: (reservedUsd, actualUsd) => settleReservedSpendUsd(ledgerFile, reservedUsd, actualUsd),
   }, deps);
 
   if (result.ok) circuit.failures = [];
   else circuit.failures.push(now);
   writeCircuit(circuitFile, circuit);
-  // Spend accrues across turns, so the ceiling bounds the routine rather than one call.
-  // Concurrent hooks share the ledger, which is why the write is serialised there.
-  if (result.costUsd) recordSpendUsd(ledgerFile, result.costUsd);
+  // Reserved paid spend is already in the shared ledger; unreserved fallback costs
+  // are recorded here. This keeps concurrent hooks below one ceiling.
+  if (result.costUsd && !result.reservedUsd) recordSpendUsd(ledgerFile, result.costUsd);
 
   return result.escalatedFrom
     ? `${result.verdict} [escalated from ${result.escalatedFrom}: ${result.escalationReason}]`
