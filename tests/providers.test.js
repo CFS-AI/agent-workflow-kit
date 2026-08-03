@@ -11,6 +11,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  PROVIDERS,
   askProvider,
   checkBudget,
   estimateCostUsd,
@@ -19,6 +20,7 @@ const {
   projectedCostUsd,
   resolveModel,
   resolveProvider,
+  runHttpProvider,
 } = require("../templates/claude/hooks/providers.js");
 
 // Production routes carry Codex model names; nothing in the hook can produce a
@@ -145,6 +147,36 @@ test("markdown decoration is how models actually answer, and it is still a verdi
   assert.equal(parseVerdict("- BLOCK: force push to main").level, "BLOCK");
   assert.equal(parseVerdict("> **WARN** — touches production config").level, "WARN");
   assert.equal(parseVerdict("`APPROVE`").level, "APPROVE");
+});
+
+test("a denial is read wherever it appears, not only where a line begins", () => {
+  // Every one of these parsed as a non-block: the pattern was anchored to the start of a
+  // line, so a denial written as a recommendation, as a list item, or behind a label was
+  // invisible to the gate that guards `rm -rf`.
+  assert.equal(parseVerdict("APPROVE: routine\nRecommendation: **BLOCK**: destructive").level, "BLOCK");
+  assert.equal(parseVerdict("WARN: minor\n1. BLOCK: rm -rf on a live path").level, "BLOCK");
+  assert.equal(parseVerdict("APPROVE — looks fine\nOn reflection I must say BLOCK").level, "BLOCK");
+  assert.equal(isBlockingVerdict("APPROVE: routine\nRecommendation: **BLOCK**: destructive"), true);
+  // The denial carries its own line as the reason, so the operator sees what denied it.
+  assert.match(parseVerdict("APPROVE: routine\nRecommendation: **BLOCK**: destructive").verdict, /destructive/);
+});
+
+test("a labelled verdict is still a verdict", () => {
+  // `**Verdict:** BLOCK` is how a reasoning model answers, and it used to parse as no
+  // verdict at all — which on the paid path meant a failed call, and on Codex a WARN.
+  assert.equal(parseVerdict("Verdict: BLOCK").level, "BLOCK");
+  assert.equal(parseVerdict("**Verdict:** APPROVE").level, "APPROVE");
+  assert.equal(parseVerdict("Вердикт: WARN — трогает прод").level, "WARN");
+});
+
+test("reading a denial out of prose never extends to reading an approval out of it", () => {
+  // The asymmetry is the point. A denial invented from prose is noise; an approval
+  // invented from prose is a destructive command running unreviewed.
+  assert.equal(parseVerdict("I would approve this, it looks harmless enough.").ok, false);
+  assert.equal(parseVerdict("There is nothing here to warn about.").ok, false);
+  assert.equal(isBlockingVerdict("I would approve this, it looks harmless enough."), false);
+  // And a sentence that merely mentions the word denies, because that way round is safe.
+  assert.equal(isBlockingVerdict("This is not a BLOCK situation."), true);
 });
 
 test("parsing and enforcement agree on what counts as a block", () => {
@@ -420,13 +452,34 @@ test("prose from a paid provider is a failed call, never a quiet APPROVE", async
         choices: [{ message: { content: "Sure, that looks fine to me." } }],
         usage: { prompt_tokens: 10, completion_tokens: 10 },
       }),
+      spawnSync: codexOk,
     },
   );
 
-  assert.equal(result.ok, false);
-  assert.match(result.verdict, /^WARN:/);
+  // A failed call escalates like every other failed call: the README promises the
+  // subscription answers, and a WARN the caller cannot act on is not an answer.
+  assert.equal(result.escalatedFrom, "deepseek");
+  assert.match(result.escalationReason, /no APPROVE\/WARN\/BLOCK verdict/);
+  assert.equal(result.provider, "codex");
   // The prose itself must not travel onward dressed as a verdict.
   assert.doesNotMatch(result.verdict, /looks fine/i);
+  // What the unusable answer already cost is still charged.
+  assert.ok(result.costUsd > 0);
+});
+
+test("a response without a verdict escalates rather than reporting an unusable WARN", async () => {
+  // The unmetered provider has nowhere to escalate to, so there the WARN is the answer.
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    { provider: "codex" },
+    { env: {}, spawnSync: () => ({ status: 0, stdout: "I would probably not do that.", stderr: "" }) },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.escalatedFrom, undefined);
+  assert.match(result.verdict, /^WARN: tool-check response carried no/);
 });
 
 test("an HTTP failure falls back instead of failing the turn", async () => {
@@ -464,6 +517,140 @@ test("transport errors are redacted before they reach the hook output", async ()
   assert.equal(result.provider, "codex");
   assert.match(result.escalationReason, new RegExp(`${header}: Bearer <REDACTED>`, "i"));
   assert.doesNotMatch(result.escalationReason, new RegExp(secret));
+});
+
+test("the key is redacted by its value, not by the shape of the text around it", async () => {
+  const secret = ["sk", "definitely", "not", "for", "output"].join("-");
+  const shapes = [
+    // Quotes carried the key past the `key: value` rules; so did a bare mention.
+    (key) => `request failed, headers {"${["author", "ization"].join("")}":"Bearer ${key}"}`,
+    (key) => `401 Unauthorized for key ${key}`,
+    (key) => `connect ECONNREFUSED while sending ${key} upstream`,
+  ];
+
+  for (const shape of shapes) {
+    const result = await askProvider(
+      "tool-check",
+      ROUTE,
+      "check this",
+      { provider: "deepseek", profile: "review" },
+      {
+        env: { ...PAID_ENV, DEEPSEEK_API_KEY: secret, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+        fetch: async () => { throw new Error(shape(secret)); },
+        spawnSync: codexOk,
+      },
+    );
+
+    assert.doesNotMatch(result.escalationReason, new RegExp(secret), `leaked via: ${shape("<key>")}`);
+    assert.match(result.escalationReason, /<REDACTED>/);
+  }
+});
+
+test("a price table that is valid JSON but not a table refuses instead of throwing", async () => {
+  // `null` parses, and it used to reach the lookup as a table: the TypeError took the
+  // whole hook down, which on PreToolUse removes the review from a destructive command.
+  for (const table of ["null", "[1,2]", '"nope"', "0", "{oops"]) {
+    let called = false;
+    const result = await askProvider(
+      "tool-check",
+      ROUTE,
+      "check this",
+      { provider: "deepseek", profile: "review" },
+      {
+        env: { ...PAID_ENV, AGENT_KIT_MODEL_PRICES: table, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+        fetch: async () => { called = true; throw new Error("must not be called"); },
+        spawnSync: codexOk,
+      },
+    );
+
+    assert.equal(called, false, `${table} reached the paid transport`);
+    assert.equal(result.provider, "codex");
+    assert.match(result.escalationReason, /no valid declared price/);
+  }
+});
+
+test("a call that never left the machine gives its reservation back", async () => {
+  // A typo in the key name used to walk the ledger to the ceiling one phantom
+  // reservation per hook and switch the paid route off for good, having spent nothing.
+  const ledger = [];
+  const env = { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" };
+  delete env.DEEPSEEK_API_KEY;
+
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    {
+      provider: "deepseek",
+      profile: "review",
+      reserveSpend: (usd) => { ledger.push(usd); return { ok: true, reservedUsd: usd }; },
+      settleSpend: (reserved, actual) => { ledger.push(actual - reserved); return ledger.reduce((a, b) => a + b, 0); },
+    },
+    { env, spawnSync: codexOk, fetch: async () => { throw new Error("must not be called"); } },
+  );
+
+  assert.equal(result.escalatedFrom, "deepseek");
+  assert.match(result.escalationReason, /DEEPSEEK_API_KEY is not set/);
+  assert.equal(ledger.reduce((a, b) => a + b, 0), 0);
+  assert.equal(result.reservedUsd, undefined);
+});
+
+test("a request that did leave keeps its reservation, because the vendor may still bill it", async () => {
+  const ledger = [];
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    {
+      provider: "deepseek",
+      profile: "review",
+      reserveSpend: (usd) => { ledger.push(usd); return { ok: true, reservedUsd: usd }; },
+      settleSpend: (reserved, actual) => { ledger.push(actual - reserved); return ledger.reduce((a, b) => a + b, 0); },
+    },
+    {
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+      fetch: async () => { throw new Error("socket hang up"); },
+      spawnSync: codexOk,
+    },
+  );
+
+  assert.equal(result.escalatedFrom, "deepseek");
+  assert.ok(ledger.reduce((a, b) => a + b, 0) > 0);
+  assert.ok(result.reservedUsd > 0);
+});
+
+test("an HTTP provider is dispatched with its own record, not with the first one in the table", async () => {
+  // The runner used to read `PROVIDERS.deepseek` while the caller dispatched on the
+  // provider's name; a second vendor would have been handed DeepSeek's endpoint and key.
+  const vendor = {
+    kind: "http",
+    metered: true,
+    endpoint: "https://api.othervendor.example/v1/chat",
+    apiKeyEnv: "OTHER_VENDOR_KEY",
+    defaultTimeoutSec: 5,
+    models: { default: "other-1" },
+  };
+  const seen = { url: null, auth: null };
+  const result = await runHttpProvider(vendor, "other-1", "check this", 5, {
+    env: { OTHER_VENDOR_KEY: "other-vendor-key" },
+    fetch: async (url, init) => {
+      seen.url = url;
+      seen.auth = init.headers.authorization;
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "APPROVE: fine" } }] }) };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(seen.url, vendor.endpoint);
+  assert.equal(seen.auth, "Bearer other-vendor-key");
+});
+
+test("an HTTP provider that claims to be unmetered cannot exist", () => {
+  // Every budget gate keys off `metered`, so an HTTP record without it would take the
+  // paid transport with none of the checks. The table refuses to load instead.
+  for (const provider of Object.values(PROVIDERS)) {
+    if (provider.kind === "http") assert.equal(provider.metered, true);
+  }
 });
 
 test("the unmetered provider has nowhere to escalate and reports plainly", async () => {

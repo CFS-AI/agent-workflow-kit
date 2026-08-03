@@ -19,10 +19,23 @@
 
 const fs = require("fs");
 const path = require("path");
+const { randomUUID } = require("crypto");
 
 const RESERVATION_LOCK_WAIT_MS = 1_000;
 const RESERVATION_LOCK_POLL_MS = 10;
-const RESERVATION_LOCK_STALE_MS = 5_000;
+const RESERVATION_LOCK_STALE_DEFAULT_MS = 5_000;
+
+/**
+ * How long a lease may sit untouched before another process may reclaim it.
+ *
+ * Read per call rather than at load, so a suite can drive the reclaim path deliberately
+ * instead of waiting seconds for it. A hold is a read plus an append — milliseconds — so
+ * the default is three orders of magnitude of headroom, not a tuning knob.
+ */
+function staleAfterMs(env = process.env) {
+  const value = Number(env.AGENT_KIT_LEDGER_STALE_MS);
+  return Number.isFinite(value) && value >= 0 ? value : RESERVATION_LOCK_STALE_DEFAULT_MS;
+}
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -60,6 +73,13 @@ function recordSpendUsd(file, usd, at = Date.now()) {
  * lease, so contention degrades to the subscription fallback rather than wedging a
  * hook. A reservation is intentionally never removed when a process dies: retaining
  * the maximum possible charge is safer than spending past the ceiling.
+ *
+ * The lease carries a token because a stale lease can be reclaimed from a holder that
+ * only looked dead. A holder that stalls past the stale window and then wakes up would
+ * otherwise write a reservation computed from a read the reclaimer has already
+ * invalidated — two calls reading $0, both fitting under the ceiling, together over it.
+ * So ownership is re-checked immediately before the write, and a holder that lost its
+ * lease reserves nothing.
  */
 function reserveSpendUsd(file, usd, ceiling, at = Date.now()) {
   const amount = Number(usd);
@@ -70,18 +90,23 @@ function reserveSpendUsd(file, usd, ceiling, at = Date.now()) {
 
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const lockFile = `${file}.reservation-lock`;
+  const token = randomUUID();
+  const holdsLease = () => {
+    try { return fs.readFileSync(lockFile, "utf8") === token; }
+    catch { return false; }
+  };
   const deadline = Date.now() + RESERVATION_LOCK_WAIT_MS;
   let acquired = false;
   while (Date.now() <= deadline) {
     try {
       const fd = fs.openSync(lockFile, "wx");
-      fs.writeFileSync(fd, String(Date.now()));
+      fs.writeFileSync(fd, token);
       fs.closeSync(fd);
       acquired = true;
       break;
     } catch {
       try {
-        if (Date.now() - fs.statSync(lockFile).mtimeMs > RESERVATION_LOCK_STALE_MS) fs.unlinkSync(lockFile);
+        if (Date.now() - fs.statSync(lockFile).mtimeMs > staleAfterMs()) fs.unlinkSync(lockFile);
       } catch {}
       sleepSync(RESERVATION_LOCK_POLL_MS);
     }
@@ -93,10 +118,12 @@ function reserveSpendUsd(file, usd, ceiling, at = Date.now()) {
     if (!Number.isFinite(spent) || spent + amount > limit) {
       return { ok: false, reason: "budget ceiling would be exceeded by paid-call reservation" };
     }
+    if (!holdsLease()) return { ok: false, reason: "paid-call reservation lost its lease" };
     fs.appendFileSync(file, `${JSON.stringify({ ts: at, usd: amount, kind: "reservation" })}\n`);
     return { ok: true, reservedUsd: amount };
   } finally {
-    try { fs.unlinkSync(lockFile); } catch {}
+    // Only ever release our own lease; the reclaimer's lock is not ours to delete.
+    try { if (holdsLease()) fs.unlinkSync(lockFile); } catch {}
   }
 }
 

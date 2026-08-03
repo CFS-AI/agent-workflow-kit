@@ -45,15 +45,38 @@ const PROVIDERS = {
   },
 };
 
+// An HTTP provider bills per call by definition, and every budget gate keys off
+// `metered`. A record that says otherwise would take the paid transport with none of the
+// checks, so the contradiction is refused at load time rather than discovered by a bill.
+for (const [name, provider] of Object.entries(PROVIDERS)) {
+  if (provider.kind === "http" && !provider.metered) {
+    throw new Error(`provider ${name} declares an HTTP transport without being metered`);
+  }
+}
+
 /**
  * The one shape a verdict may take, used for both parsing and enforcement.
  *
- * Models answer in markdown — `**BLOCK**: …`, `- BLOCK — …`, `> WARN: …` — so
- * decoration and `:`/`-`/em-dash separators are all part of the verdict. Prose that
- * merely opens with the word ("Approve only if …") is not: the keyword has to be
- * followed by a separator or end the line.
+ * Models answer in markdown — `**BLOCK**: …`, `- BLOCK — …`, `> WARN: …` — and often
+ * behind a label (`**Verdict:** APPROVE`), so decoration, a leading label and
+ * `:`/`-`/em-dash separators are all part of the verdict. Prose that merely opens with
+ * the word ("Approve only if …") is not: the keyword has to be followed by a separator
+ * or end the line.
  */
-const VERDICT_RE = /^[\s>*_`#+-]*(APPROVE|WARN|BLOCK)[*_`]*\s*(?:[:—–-]\s*(.*))?$/i;
+const VERDICT_RE =
+  /^[\s>*_`#+-]*(?:[*_`]*(?:verdict|вердикт)[*_`]*\s*[:—–-][*_`\s]*)?[*_`]*(APPROVE|WARN|BLOCK)[*_`]*\s*(?:[:—–-]\s*(.*))?$/i;
+
+/**
+ * A denial counts wherever it appears, including in the middle of a sentence.
+ *
+ * The line-anchored form above is right for APPROVE and WARN — prose must never be able
+ * to manufacture an approval — and wrong for BLOCK, asymmetrically so. `APPROVE:
+ * routine\nRecommendation: **BLOCK**: destructive` parsed as APPROVE, and on a gate that
+ * guards `rm -rf`, force-push and `terraform apply` a missed denial is a fail-open while
+ * a denial read out of prose is only noise. So BLOCK is matched against the whole
+ * response and outranks whatever the line parser found.
+ */
+const BLOCK_ANYWHERE_RE = /\bBLOCK\b/i;
 
 /** Heavier verdicts win over lighter ones no matter where in the response they appear. */
 const VERDICT_SEVERITY = { APPROVE: 1, WARN: 2, BLOCK: 3 };
@@ -120,7 +143,11 @@ function maxTokens(env = process.env) {
  */
 function loadPrices(env = process.env) {
   try {
-    return JSON.parse(env.AGENT_KIT_MODEL_PRICES || "{}");
+    const parsed = JSON.parse(env.AGENT_KIT_MODEL_PRICES || "{}");
+    // `null` is valid JSON, and it used to reach the lookup as a table: every price read
+    // threw a TypeError and took the whole hook down with it, where a broken price table
+    // has to mean "unpriced, refuse the call".
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return {};
   }
@@ -141,11 +168,37 @@ function priceFor(model, prices) {
   return { in: input, out: output };
 }
 
-/** Removes credential-shaped fragments before a transport error reaches hook output. */
-function safeReason(reason) {
-  return String(reason || "unknown provider error")
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1<REDACTED>")
-    .replace(/(api[_-]?key|password|secret|token)\s*[:=]\s*[^\s,;]+/gi, "$1=<REDACTED>");
+/**
+ * Every credential this layer could be holding, so redaction can match values.
+ *
+ * Short values are skipped: a two-character "key" would redact half the message and tell
+ * the operator nothing, and no real API key is that short.
+ */
+function secretValues(env) {
+  const values = [];
+  for (const provider of Object.values(PROVIDERS)) {
+    if (!provider.apiKeyEnv) continue;
+    const value = env[provider.apiKeyEnv];
+    if (typeof value === "string" && value.trim().length >= 8) values.push(value.trim());
+  }
+  return values;
+}
+
+/**
+ * Removes credentials before a transport error reaches hook output.
+ *
+ * Shape alone was not enough. `{"authorization":"Bearer sk-…"}` carries the key past a
+ * `key: value` regex on the quotes, and `401 Unauthorized for key sk-…` carries it past
+ * on the missing separator — both reached `additionalContext` intact. The key's own
+ * value is the only reliable needle, so it is redacted first; the shape rules stay as a
+ * second pass for credentials this layer never held and cannot look up.
+ */
+function safeReason(reason, env = process.env) {
+  let text = String(reason || "unknown provider error");
+  for (const secret of secretValues(env || {})) text = text.split(secret).join("<REDACTED>");
+  return text
+    .replace(/(authorization["'\s]*[:=]["'\s]*bearer\s+)[^\s,;"']+/gi, "$1<REDACTED>")
+    .replace(/(api[_-]?key|password|secret|token)["'\s]*[:=]["'\s]*[^\s,;"']+/gi, "$1=<REDACTED>");
 }
 
 /**
@@ -232,14 +285,24 @@ function runCodex(route, prompt, timeoutSec, deps = {}) {
   return { ok: true, text, usage: null };
 }
 
-async function runDeepSeek(model, prompt, timeoutSec, deps = {}) {
+/**
+ * The HTTP transport, driven by the provider record it was dispatched for.
+ *
+ * It used to read `PROVIDERS.deepseek` directly while the caller dispatched on the
+ * provider's *name*. The two agreed only because the table holds exactly one HTTP entry:
+ * a second vendor would have been sent DeepSeek's endpoint and DeepSeek's key while its
+ * own `metered` flag skipped every budget gate.
+ *
+ * `sent` says whether anything actually left the machine. A call that never reached the
+ * network cannot be billed, and the reservation it holds has to come back.
+ */
+async function runHttpProvider(provider, model, prompt, timeoutSec, deps = {}) {
   const env = deps.env || process.env;
-  const provider = PROVIDERS.deepseek;
   const key = env[provider.apiKeyEnv];
-  if (!key) return { ok: false, reason: `${provider.apiKeyEnv} is not set` };
+  if (!key) return { ok: false, sent: false, reason: `${provider.apiKeyEnv} is not set` };
 
   const doFetch = deps.fetch || globalThis.fetch;
-  if (!doFetch) return { ok: false, reason: "no fetch implementation available" };
+  if (!doFetch) return { ok: false, sent: false, reason: "no fetch implementation available" };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
@@ -254,12 +317,19 @@ async function runDeepSeek(model, prompt, timeoutSec, deps = {}) {
       }),
       signal: controller.signal,
     });
-    if (!response.ok) return { ok: false, reason: `HTTP ${response.status}` };
+    if (!response.ok) return { ok: false, sent: true, reason: `HTTP ${response.status}` };
     const body = await response.json();
     const text = String(body?.choices?.[0]?.message?.content || "").trim();
     return { ok: true, text, usage: body?.usage || null };
   } catch (err) {
-    return { ok: false, reason: `request failed: ${err && err.name === "AbortError" ? "timeout" : safeReason(err && err.message)}` };
+    // The request did leave, so `sent` stays true: a timeout or a socket error mid-flight
+    // says nothing about whether the vendor is billing for it, and the reservation is
+    // held rather than guessed away.
+    return {
+      ok: false,
+      sent: true,
+      reason: `request failed: ${err && err.name === "AbortError" ? "timeout" : safeReason(err && err.message, env)}`,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -275,20 +345,29 @@ async function runDeepSeek(model, prompt, timeoutSec, deps = {}) {
  * whatever markdown the model used cannot reach the caller's matching.
  */
 function parseVerdict(text) {
+  const body = String(text || "");
+  const lines = body.split("\n").map((line) => line.trim());
   let best = null;
-  for (const line of String(text || "").split("\n")) {
-    const match = VERDICT_RE.exec(line.trim());
+  for (const line of lines) {
+    const match = VERDICT_RE.exec(line);
     if (!match) continue;
     const level = match[1].toUpperCase();
     if (!best || VERDICT_SEVERITY[level] > VERDICT_SEVERITY[best.level]) {
       best = { level, detail: (match[2] || "").trim() };
     }
   }
+  if ((!best || best.level !== "BLOCK") && BLOCK_ANYWHERE_RE.test(body)) {
+    // The carrier line goes in as the detail so the operator sees what denied the call,
+    // rather than a bare BLOCK with no stated reason.
+    best = { level: "BLOCK", detail: lines.find((line) => BLOCK_ANYWHERE_RE.test(line)) || "" };
+  }
   if (!best) return { ok: false, reason: "response carried no APPROVE/WARN/BLOCK verdict" };
+  // A carrier line that already opens with the level would otherwise read `BLOCK: BLOCK …`.
+  const detail = best.detail.replace(new RegExp(`^${best.level}\\b[\\s:—–-]*`, "i"), "").trim();
   return {
     ok: true,
     level: best.level,
-    verdict: best.detail ? `${best.level}: ${best.detail}` : best.level,
+    verdict: detail ? `${best.level}: ${detail}` : best.level,
   };
 }
 
@@ -318,6 +397,7 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
   const timeoutSec = options.timeoutSec || provider.defaultTimeoutSec;
   const model = resolveModel(providerName, route, options.profile);
   let reservedUsd = 0;
+  let ceilingBreached = null;
 
   const escalate = async (reason, costUsd = 0) => {
     const fallback = await askProvider(kind, route, prompt, { ...options, provider: DEFAULT_PROVIDER }, deps);
@@ -325,6 +405,7 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
       ...fallback,
       costUsd,
       ...(reservedUsd > 0 ? { reservedUsd } : {}),
+      ...(ceilingBreached ? { ceilingBreached } : {}),
       escalatedFrom: providerName,
       escalationReason: reason,
     };
@@ -344,13 +425,27 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
     }
   }
 
-  const raw = providerName === "codex"
-    ? runCodex(route, prompt, timeoutSec, deps)
-    : await runDeepSeek(model, prompt, timeoutSec, deps);
+  const raw = provider.kind === "http"
+    ? await runHttpProvider(provider, model, prompt, timeoutSec, deps)
+    : runCodex(route, prompt, timeoutSec, deps);
 
   if (!raw.ok) {
+    // A call that never left the machine cannot be billed, so its reservation is released
+    // here. Without this a typo in the key name walked the ledger to the ceiling one
+    // phantom reservation per hook and switched the paid route off for good, having spent
+    // nothing. Anything that did reach the network keeps the worst case, because we
+    // cannot prove the vendor is not charging for it.
+    if (raw.sent === false && reservedUsd > 0 && typeof options.settleSpend === "function") {
+      options.settleSpend(reservedUsd, 0);
+      reservedUsd = 0;
+    }
     if (providerName !== DEFAULT_PROVIDER) return escalate(raw.reason);
-    return { ok: false, provider: providerName, verdict: `WARN: ${kind} unavailable: ${raw.reason}` };
+    return {
+      ok: false,
+      transportFailed: true,
+      provider: providerName,
+      verdict: `WARN: ${kind} unavailable: ${raw.reason}`,
+    };
   }
 
   let costUsd = 0;
@@ -366,16 +461,30 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
       );
     }
     costUsd = measured;
-    if (reservedUsd > 0 && typeof options.settleSpend === "function") options.settleSpend(reservedUsd, costUsd);
+    if (reservedUsd > 0 && typeof options.settleSpend === "function") {
+      // Settlement reconciles a bound to a fact, and the fact can be larger: the
+      // reservation covers `AGENT_KIT_MAX_TOKENS` of output, which is a request, not a
+      // promise the vendor made. When a longer answer lands the total past the ceiling
+      // the money is already spent, so it is recorded and reported rather than hidden —
+      // the next call is refused by the ceiling it just crossed.
+      const total = Number(options.settleSpend(reservedUsd, costUsd));
+      const ceiling = Number(env.AGENT_KIT_BUDGET_USD || 0);
+      if (Number.isFinite(total) && ceiling > 0 && total > ceiling) ceilingBreached = { total, ceiling };
+    }
   }
 
   const parsed = parseVerdict(raw.text);
   if (!parsed.ok) {
+    // A response without a verdict is a failed call like any other, so it escalates to
+    // the subscription provider instead of being handed back as a WARN nobody can act
+    // on. The default provider has nowhere to escalate to and says so plainly.
+    if (providerName !== DEFAULT_PROVIDER) return escalate(`${providerName} ${parsed.reason}`, costUsd);
     return {
       ok: false,
       provider: providerName,
       costUsd,
       ...(reservedUsd > 0 ? { reservedUsd } : {}),
+      ...(ceilingBreached ? { ceilingBreached } : {}),
       verdict: `WARN: ${kind} ${parsed.reason}`,
     };
   }
@@ -384,6 +493,7 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
     provider: providerName,
     costUsd,
     ...(reservedUsd > 0 ? { reservedUsd } : {}),
+    ...(ceilingBreached ? { ceilingBreached } : {}),
     level: parsed.level,
     verdict: parsed.verdict,
   };
@@ -404,6 +514,6 @@ module.exports = {
   resolveModel,
   resolveProvider,
   runCodex,
-  runDeepSeek,
+  runHttpProvider,
   safeReason,
 };

@@ -3,7 +3,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { askProvider, isBlockingVerdict } = require("./providers.js");
+const { askProvider, safeReason } = require("./providers.js");
 const {
   readSpentUsd,
   recordSpendUsd,
@@ -62,6 +62,15 @@ function shouldReviewTool(tool, command) {
   return tool === "Bash" && /(rm\s+-rf|git\s+(reset\s+--hard|push\s+--force|clean\s+-fd)|sudo\s+|terraform\s+apply|npm\s+publish|curl\b.*\|\s*(bash|sh))/i.test(command);
 }
 
+/**
+ * Ask the routed provider and return both the note to show and the decision to enforce.
+ *
+ * The two used to be one string. The hook composed `${verdict} [escalated from …]` for
+ * display and then re-parsed that same string to decide whether to deny — and the
+ * bracketed suffix broke the match, so an escalated `BLOCK` silently stopped denying
+ * anything. The verdict is now decided once, on the provider's own answer, and the
+ * display string is built afterwards from a decision that can no longer drift.
+ */
 async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {}) {
   const route = PROFILES[profile] || PROFILES.review;
   const projectRoot = process.env.CLAUDE_PROJECT_DIR || path.resolve(__dirname, "..", "..");
@@ -71,7 +80,9 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
   const circuit = readCircuit(circuitFile);
   const now = Date.now();
   circuit.failures = (circuit.failures || []).filter((ts) => now - ts <= CIRCUIT_WINDOW_MS);
-  if (isCircuitOpen(circuit, now)) return `WARN: Codex ${kind} skipped; circuit is open after repeated failures.`;
+  if (isCircuitOpen(circuit, now)) {
+    return { note: `WARN: Codex ${kind} skipped; circuit is open after repeated failures.`, blocking: false };
+  }
 
   const result = await askProvider(kind, route, prompt, {
     profile,
@@ -81,16 +92,24 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
     settleSpend: (reservedUsd, actualUsd) => settleReservedSpendUsd(ledgerFile, reservedUsd, actualUsd),
   }, deps);
 
-  if (result.ok) circuit.failures = [];
-  else circuit.failures.push(now);
+  // The breaker exists to stop hammering a transport that is down, so only a transport
+  // that never answered counts against it. A reviewer that replied without a verdict is
+  // alive; counting that as a failure let one chatty provider close the breaker for
+  // every profile, including the ones still on the subscription.
+  if (result.transportFailed) circuit.failures.push(now);
+  else circuit.failures = [];
   writeCircuit(circuitFile, circuit);
   // Reserved paid spend is already in the shared ledger; unreserved fallback costs
   // are recorded here. This keeps concurrent hooks below one ceiling.
   if (result.costUsd && !result.reservedUsd) recordSpendUsd(ledgerFile, result.costUsd);
 
-  return result.escalatedFrom
-    ? `${result.verdict} [escalated from ${result.escalatedFrom}: ${result.escalationReason}]`
-    : result.verdict;
+  const notes = [result.verdict];
+  if (result.escalatedFrom) notes.push(`[escalated from ${result.escalatedFrom}: ${result.escalationReason}]`);
+  if (result.ceilingBreached) {
+    const { total, ceiling } = result.ceilingBreached;
+    notes.push(`[budget ceiling crossed on settlement: $${total.toFixed(4)} of $${ceiling}]`);
+  }
+  return { note: notes.join(" "), blocking: result.ok === true && result.level === "BLOCK" };
 }
 
 async function main(input) {
@@ -104,7 +123,7 @@ async function main(input) {
     if (shouldSuggestDelegation(prompt)) hints.push("Execution work detected: consider codex-delegate; Codex edits, orchestrator review-gates and commits.");
     if (shouldReviewPrompt(prompt)) {
       const profile = choosePlanningProfile(prompt);
-      const note = await askCodex("planning-check", `Review this prompt. Return one line APPROVE/WARN/BLOCK.\n\n${prompt}`, profile, 25);
+      const { note } = await askCodex("planning-check", `Review this prompt. Return one line APPROVE/WARN/BLOCK.\n\n${prompt}`, profile, 25);
       hints.push(`Codex ${profile} note: ${note}`);
     }
     return { hookSpecificOutput: { hookEventName: eventName, additionalContext: hints.join("\n") } };
@@ -114,8 +133,8 @@ async function main(input) {
     const tool = String(input.tool_name || "");
     const command = String((input.tool_input || {}).command || "");
     if (!shouldReviewTool(tool, command)) return null;
-    const note = await askCodex("tool-check", `Review pending tool call. Return one line APPROVE/WARN/BLOCK.\nTool=${tool}\nCommand=${command}`, "review");
-    return strict && isBlockingVerdict(note)
+    const { note, blocking } = await askCodex("tool-check", `Review pending tool call. Return one line APPROVE/WARN/BLOCK.\nTool=${tool}\nCommand=${command}`, "review");
+    return strict && blocking
       ? { decision: "deny", reason: note }
       : { hookSpecificOutput: { hookEventName: eventName, additionalContext: `Codex review note: ${note}` } };
   }
@@ -132,8 +151,19 @@ if (require.main === module) {
   process.stdin.on("end", async () => {
     let input = {};
     try { input = JSON.parse(raw || "{}"); } catch {}
-    const output = await main(input);
-    if (output) console.log(JSON.stringify(output));
+    try {
+      const output = await main(input);
+      if (output) console.log(JSON.stringify(output));
+    } catch (err) {
+      // A hook that throws prints nothing, and printing nothing on PreToolUse silently
+      // removes the review from a destructive command. Say what broke instead.
+      console.log(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: input.hook_event_name || "Unknown",
+          additionalContext: `Codex copilot failed: ${safeReason(err && err.message)}`,
+        },
+      }));
+    }
   });
 }
 

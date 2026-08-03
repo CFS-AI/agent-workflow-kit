@@ -95,13 +95,23 @@ repositories whose prompts and commands you are willing to disclose to that vend
 ### Configuration
 
 ```bash
-export AGENT_KIT_PROVIDER_REVIEW=deepseek         # move one profile, not all of them
+export AGENT_KIT_PROVIDER_PLAN=deepseek           # move one profile, not all of them
 export DEEPSEEK_API_KEY=...                       # never committed; read at call time
 export AGENT_KIT_ALLOW_EXTERNAL_PROMPTS=1         # explicit acknowledgement of third-party prompt transfer
 export AGENT_KIT_BUDGET_USD=5                     # required — no ceiling, no metered call
 export AGENT_KIT_MODEL_PRICES='{"deepseek-reasoner":{"in":0.55,"out":2.19}}'
 export AGENT_KIT_MAX_TOKENS=512                   # optional; bounds response length and cost
 ```
+
+`AGENT_KIT_PROVIDER_<PROFILE>` moves exactly the profile it names. `AGENT_KIT_PROVIDER`
+without a suffix moves **every** profile, including ones added to the kit later, and a
+per-profile setting overrides it. Prefer the per-profile form: the two channels described
+above do not carry the same material, and `review` is the one that sends shell commands.
+
+The example deliberately moves `plan` rather than `review`. The `review` profile serves
+the `PreToolUse` gate, so routing it to a paid vendor is what sends `sudo`, connection
+strings and anything else in a flagged command off the machine; `plan` sends prompt text
+only. Move `review` only when you mean to.
 
 Routing produces Codex model names (`gpt-5.6-terra`), which mean nothing to a paid
 vendor, so each provider declares its own model per profile: `prime`, `plan` and
@@ -123,20 +133,35 @@ Rules the layer enforces:
   command text described above will go to the third-party provider.
 - **The ceiling is a limit, not a trigger.** A call is refused when its worst case —
   the prompt as sent, plus `AGENT_KIT_MAX_TOKENS` of output — would carry the total
-  past the ceiling. The worst-case amount is atomically reserved before the request,
-  so concurrent hooks cannot cross the ceiling together; a crashed call keeps its
-  reservation conservatively rather than reopening budget that may have been spent.
+  past the ceiling. The worst-case amount is reserved under a lock before the request, so
+  concurrent hooks cannot cross the ceiling together. Two things the reservation cannot
+  promise, and does not pretend to: `AGENT_KIT_MAX_TOKENS` is a request rather than a
+  guarantee, so a vendor answering past it settles above the ceiling — the overshoot is
+  recorded and reported in the note, and the next call is refused. And a call that
+  crashed, timed out or failed in flight keeps its reservation, because we cannot prove
+  the vendor is not billing it; a call that never left the machine gets it back.
 - **A response with no usable `usage` block is a failed call.** Unmeasurable spend is
   unknown, never zero: the answer is discarded and the worst case is charged. A block
   that is absent, empty, or all zeros is the same claim — no call that reached a model
   consumed nothing — so no vendor can buy unlimited calls for $0.
 - **A response without an `APPROVE`/`WARN`/`BLOCK` verdict is a failed call**, not a
   quiet approval, and the prose is never passed on dressed as a verdict.
-- **The heaviest verdict wins.** `BLOCK` outranks `WARN` outranks `APPROVE` wherever
-  each appears in the response, and markdown decoration (`**BLOCK**:`, `- BLOCK —`)
-  is read as a verdict, because that is how models actually answer.
+- **The heaviest verdict wins, and denial is read the most generously.** `BLOCK`
+  outranks `WARN` outranks `APPROVE`, and markdown decoration (`**BLOCK**:`, `- BLOCK —`,
+  `**Verdict:** BLOCK`) is read as a verdict, because that is how models actually answer.
+  A denial counts anywhere in the response, including mid-sentence; an approval has to
+  stand as its own line. The asymmetry is deliberate: on a gate guarding `rm -rf` a
+  missed denial runs the command, while a denial read out of prose only costs a retry.
 - **Any of the above escalates to the subscription provider**, reporting what it
-  escalated from and why. Escalation is never silent.
+  escalated from and why. Escalation is never silent, and the decision to deny is taken
+  on the provider's own verdict, never re-read out of the note built for display.
+- **The breaker counts transports, not opinions.** Three failed *transports* in five
+  minutes stop the copilot for the rest of the window. A reviewer that answered without a
+  verdict is alive, so it does not count — otherwise one talkative paid provider on one
+  profile would disable review on every profile, including the ones still on Codex.
+- **In strict mode a `BLOCK` denies your tool call outright.** Routing a profile to a
+  paid vendor therefore gives that vendor a veto, not an opinion. Set
+  `CODEX_COPILOT_MODE=strict` with that in mind.
 
 Spend is recorded in `.claude/cache/provider-spend.jsonl`, one appended line per call,
 so concurrent hooks cannot lose each other's entries. `apply-kit.sh` adds
