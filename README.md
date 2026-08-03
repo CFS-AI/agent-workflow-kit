@@ -69,6 +69,36 @@ Then customize placeholders marked `TODO:`.
 4. **One writer per worktree.** Parallel agents get isolated git worktrees.
 5. **Publish only scrubbed artifacts.** Run `./scripts/scrub-check.sh` before pushing.
 
+## Providers (subscription by default, paid API opt-in)
+
+Review and planning calls go through `.claude/hooks/providers.js`. By default every
+profile runs on the Codex CLI, where an extra call is covered by the subscription.
+A paid HTTP provider (DeepSeek) can serve individual profiles, but it is opt-in and
+guarded, because it changes two things at once: calls cost money, and the answer can
+come back as prose instead of a verdict.
+
+```bash
+export AGENT_KIT_PROVIDER_REVIEW=deepseek         # move one profile, not all of them
+export DEEPSEEK_API_KEY=...                       # never committed; read at call time
+export AGENT_KIT_BUDGET_USD=5                     # required — no ceiling, no metered call
+export AGENT_KIT_MODEL_PRICES='{"deepseek-chat":{"in":0.27,"out":1.1}}'
+```
+
+Rules the layer enforces:
+
+- **A model with no declared price is unpriced, never free.** An unpriced paid model
+  silently recorded at $0 is how a budget goes blind, so the call is refused instead.
+- **No ceiling, no metered call.** `AGENT_KIT_BUDGET_USD` is required, and spend
+  accrues across turns so the ceiling bounds the routine rather than one call.
+- **A response without an `APPROVE`/`WARN`/`BLOCK` verdict is a failed call**, not a
+  quiet approval, and the prose is never passed on dressed as a verdict.
+- **Any of the above escalates to the subscription provider**, reporting what it
+  escalated from and why. Escalation is never silent.
+
+Prices in the example above are placeholders — declare the ones you have actually
+verified with the vendor. Verify the layer with `node --test tests/*.test.js`: the
+transport is injected, so the suite needs no API key and makes no network calls.
+
 ## Optional CFS pack
 
 The CFS pack is for OpenClaw/CFS-style operations and includes:
