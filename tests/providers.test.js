@@ -69,20 +69,27 @@ test("a prototype property name is not a provider", () => {
 });
 
 test("a prototype property name cannot reach the paid transport either", async () => {
-  const result = await askProvider(
-    "tool-check",
-    ROUTE,
-    "check this",
-    { provider: "__proto__", profile: "review" },
-    {
-      env: PAID_ENV,
-      spawnSync: codexOk,
-      fetch: async () => { throw new Error("must not be called"); },
-    },
-  );
+  for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+    let called = false;
+    const result = await askProvider(
+      "tool-check",
+      ROUTE,
+      "check this",
+      { provider: name, profile: "review" },
+      {
+        env: PAID_ENV,
+        spawnSync: codexOk,
+        fetch: async () => { called = true; throw new Error("must not be called"); },
+      },
+    );
 
-  assert.equal(result.provider, "codex");
-  assert.equal(result.ok, true);
+    // Escalation swallows a throwing transport, so landing on Codex proves nothing on
+    // its own: the API key must never have left, which only the counter can say.
+    assert.equal(called, false, `${name} reached the paid transport`);
+    assert.equal(result.provider, "codex");
+    assert.equal(result.ok, true);
+    assert.equal(result.escalatedFrom, undefined);
+  }
 });
 
 test("prose is not a verdict", () => {
@@ -229,6 +236,40 @@ test("an empty usage block is no usage at all", async () => {
   );
 
   assert.equal(result.escalatedFrom, "deepseek");
+  assert.ok(result.costUsd > 0);
+});
+
+test("a usage block that accounts for no tokens is no usage at all", async () => {
+  // OpenAI-compatible gateways answer with a well-formed usage block full of zeros.
+  // No real call costs nothing, so zeros are an unmeasured call, not a free one.
+  assert.equal(
+    estimateCostUsd("deepseek-chat", { prompt_tokens: 0, completion_tokens: 0 }, JSON.parse(PRICES)),
+    null,
+  );
+  // `1e999` parses out of a JSON body as Infinity, and an infinite cost is one the
+  // ledger drops as unrecordable — which is the $0 call again, wearing a big number.
+  assert.equal(
+    estimateCostUsd("deepseek-chat", { prompt_tokens: 1e999, completion_tokens: 0 }, JSON.parse(PRICES)),
+    null,
+  );
+
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    { provider: "deepseek", profile: "review" },
+    {
+      env: PAID_ENV,
+      fetch: fakeFetch({
+        choices: [{ message: { content: "APPROVE: fine" } }],
+        usage: { prompt_tokens: 0, completion_tokens: 0 },
+      }),
+      spawnSync: codexOk,
+    },
+  );
+
+  assert.equal(result.escalatedFrom, "deepseek");
+  assert.match(result.escalationReason, /unmeasurable/i);
   assert.ok(result.costUsd > 0);
 });
 

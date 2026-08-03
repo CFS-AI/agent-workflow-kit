@@ -132,17 +132,20 @@ function loadPrices(env = process.env) {
 /**
  * What a completed call cost, or `null` when that cannot be known.
  *
- * A `usage` block that carries no token counts is no usage at all — reading it as
- * zero tokens turns an unmeasured call into a free one.
+ * A `usage` block that accounts for no tokens is no usage at all — reading it as zero
+ * tokens turns an unmeasured call into a free one. Absent counts and a well-formed
+ * block of zeros are the same claim, and OpenAI-compatible gateways make the second
+ * one: no call that reached a model consumed nothing, so zero means unmeasured.
  */
 function estimateCostUsd(model, usage, prices) {
   const price = prices[model];
   if (!price || usage == null) return null;
   const inTok = Number(usage.prompt_tokens);
   const outTok = Number(usage.completion_tokens);
-  if (!Number.isFinite(inTok) && !Number.isFinite(outTok)) return null;
-  return (Math.max(Number.isFinite(inTok) ? inTok : 0, 0) / 1e6) * Number(price.in || 0)
-    + (Math.max(Number.isFinite(outTok) ? outTok : 0, 0) / 1e6) * Number(price.out || 0);
+  const billedIn = Number.isFinite(inTok) && inTok > 0 ? inTok : 0;
+  const billedOut = Number.isFinite(outTok) && outTok > 0 ? outTok : 0;
+  if (billedIn + billedOut <= 0) return null;
+  return (billedIn / 1e6) * Number(price.in || 0) + (billedOut / 1e6) * Number(price.out || 0);
 }
 
 /**

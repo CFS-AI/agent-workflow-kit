@@ -11,6 +11,7 @@ const {
   askCodex,
   choosePlanningProfile,
   isCircuitOpen,
+  main,
 } = require("../templates/claude/hooks/codex-copilot.js");
 const { readSpentUsd } = require("../templates/claude/hooks/ledger.js");
 
@@ -31,6 +32,63 @@ function withProjectRoot(fn) {
       else process.env.CLAUDE_PROJECT_DIR = previous;
     });
 }
+
+// main() takes no injected transport, so the reviewer is stubbed where the hook looks
+// for it: the Codex binary itself. That also covers the wiring between the two.
+function withStubbedCodex(verdict, mode, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-kit-bin-"));
+  const bin = path.join(dir, "codex-stub");
+  fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(verdict)}\n`);
+  fs.chmodSync(bin, 0o755);
+  const previous = { bin: process.env.CODEX_COPILOT_BIN, mode: process.env.CODEX_COPILOT_MODE };
+  process.env.CODEX_COPILOT_BIN = bin;
+  process.env.CODEX_COPILOT_MODE = mode;
+  const restore = (key, value) => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  };
+  return Promise.resolve(fn()).finally(() => {
+    restore("CODEX_COPILOT_BIN", previous.bin);
+    restore("CODEX_COPILOT_MODE", previous.mode);
+  });
+}
+
+const RISKY_CALL = {
+  hook_event_name: "PreToolUse",
+  tool_name: "Bash",
+  tool_input: { command: "rm -rf /var/tmp/agent-kit-not-real" },
+};
+
+test("strict mode denies the tool call on a verdict of BLOCK", async () => {
+  // A detail-less `BLOCK` is what a model returns when asked for one line, and it is
+  // the shape that used to slip past enforcement while parsing accepted it.
+  await withProjectRoot(() => withStubbedCodex("BLOCK", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.decision, "deny");
+    assert.match(output.reason, /BLOCK/);
+  }));
+
+  await withProjectRoot(() => withStubbedCodex("**BLOCK** — force push to main", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.decision, "deny");
+  }));
+});
+
+test("strict mode is not a blanket deny", async () => {
+  await withProjectRoot(() => withStubbedCodex("APPROVE: scoped to a temp path", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.decision, undefined);
+    assert.match(output.hookSpecificOutput.additionalContext, /APPROVE/);
+  }));
+});
+
+test("outside strict mode a BLOCK advises instead of denying", async () => {
+  await withProjectRoot(() => withStubbedCodex("BLOCK", "advisory", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.decision, undefined);
+    assert.match(output.hookSpecificOutput.additionalContext, /BLOCK/);
+  }));
+});
 
 test("maps GPT-5.6 profiles by responsibility", () => {
   assert.deepEqual(PROFILES.prime, { model: "gpt-5.6-sol", effort: "xhigh" });
@@ -96,6 +154,32 @@ test("the ledger stops the routine before the ceiling is crossed, not after", as
     assert.equal(calls, 2);
     assert.equal(readSpentUsd(ledgerFile).toFixed(2), "4.38");
     assert.ok(readSpentUsd(ledgerFile) <= 5);
+  });
+});
+
+test("a provider that reports zero tokens cannot buy unlimited calls for $0", async () => {
+  await withProjectRoot(async (ledgerFile) => {
+    let calls = 0;
+    const deps = {
+      env: { ...PAID_ENV, AGENT_KIT_MAX_TOKENS: "1000000" },
+      spawnSync: () => ({ status: 0, stdout: "APPROVE: codex answered", stderr: "" }),
+      fetch: async () => {
+        calls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [{ message: { content: "APPROVE: fine" } }],
+            usage: { prompt_tokens: 0, completion_tokens: 0 },
+          }),
+        };
+      },
+    };
+
+    for (let i = 0; i < 6; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+
+    assert.equal(calls, 2);
+    assert.ok(readSpentUsd(ledgerFile) > 0);
   });
 });
 

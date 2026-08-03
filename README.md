@@ -121,8 +121,9 @@ Rules the layer enforces:
   the prompt as sent, plus `AGENT_KIT_MAX_TOKENS` of output — would carry the total
   past the ceiling, so the ceiling cannot be crossed by the call that tests it.
 - **A response with no usable `usage` block is a failed call.** Unmeasurable spend is
-  unknown, never zero: the answer is discarded and the worst case is charged, so a
-  vendor that omits `usage` cannot buy unlimited calls for $0.
+  unknown, never zero: the answer is discarded and the worst case is charged. A block
+  that is absent, empty, or all zeros is the same claim — no call that reached a model
+  consumed nothing — so no vendor can buy unlimited calls for $0.
 - **A response without an `APPROVE`/`WARN`/`BLOCK` verdict is a failed call**, not a
   quiet approval, and the prose is never passed on dressed as a verdict.
 - **The heaviest verdict wins.** `BLOCK` outranks `WARN` outranks `APPROVE` wherever
@@ -131,8 +132,8 @@ Rules the layer enforces:
 - **Any of the above escalates to the subscription provider**, reporting what it
   escalated from and why. Escalation is never silent.
 
-Spend is recorded in `.claude/cache/provider-spend.jsonl`, appended under a lock so
-concurrent hooks cannot lose each other's entries. `apply-kit.sh` adds
+Spend is recorded in `.claude/cache/provider-spend.jsonl`, one appended line per call,
+so concurrent hooks cannot lose each other's entries. `apply-kit.sh` adds
 `.claude/cache/` to the target's `.gitignore`; keep it there, since a committed
 ledger both leaks usage and resets the ceiling on merge.
 

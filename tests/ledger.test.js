@@ -23,15 +23,23 @@ function tempLedger() {
   return path.join(dir, "cache", "provider-spend.jsonl");
 }
 
-function recordInChild(file, usd, times) {
+function recordInChild(file, usd, times, timeoutMs = 30_000) {
   const script = `
     const { recordSpendUsd } = require(${JSON.stringify(LEDGER_MODULE)});
     for (let i = 0; i < ${times}; i += 1) recordSpendUsd(${JSON.stringify(file)}, ${usd});
   `;
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["-e", script], { stdio: "inherit" });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`recorder did not finish within ${timeoutMs}ms`));
+    }, timeoutMs);
     child.on("error", reject);
-    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`child exited ${code}`))));
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`child exited ${code}`));
+    });
   });
 }
 
@@ -56,6 +64,22 @@ test("concurrent recorders lose nothing", async () => {
 
   // 3 hooks x 40 calls x 1.37 — the ceiling only works if every one of them lands.
   assert.equal(readSpentUsd(file).toFixed(2), "164.40");
+});
+
+test("a stray lock directory next to the ledger cannot wedge the recorder", async () => {
+  const file = tempLedger();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const lockDir = `${file}.lock`;
+  fs.mkdirSync(lockDir);
+  fs.writeFileSync(path.join(lockDir, "stray"), "");
+  const stale = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(lockDir, stale, stale);
+
+  // A leftover directory rmdir cannot remove — non-empty, or owned by another user —
+  // must not cost the hook more than the append itself. Recording spend runs
+  // synchronously inside a Claude Code turn: anything unbounded here hangs the turn.
+  await recordInChild(file, 1.37, 1, 5_000);
+  assert.equal(readSpentUsd(file).toFixed(2), "1.37");
 });
 
 test("a corrupt line does not erase the spend recorded around it", () => {
