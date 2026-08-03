@@ -139,7 +139,11 @@ Rules the layer enforces:
   guarantee, so a vendor answering past it settles above the ceiling — the overshoot is
   recorded and reported in the note, and the next call is refused. And a call that
   crashed, timed out or failed in flight keeps its reservation, because we cannot prove
-  the vendor is not billing it; a call that never left the machine gets it back.
+  the vendor is not billing it; a call that never left the machine, or that the vendor
+  refused at the door (`401`, `403`, `429` and the like — rejected before any model ran),
+  gets it back. Holding those was how a wrong or rotated key walked the ledger to the
+  ceiling one phantom reservation per hook and switched the paid route off, having spent
+  nothing.
 - **A response with no usable `usage` block is a failed call.** Unmeasurable spend is
   unknown, never zero: the answer is discarded and the worst case is charged. A block
   that is absent, empty, or all zeros is the same claim — no call that reached a model
@@ -150,6 +154,10 @@ Rules the layer enforces:
   decoration (`**BLOCK**:`, `- BLOCK —`, `**Verdict:** BLOCK`) is read as a verdict, as is
   a verdict behind whatever introduced it (`Recommendation: BLOCK: …`, `1. BLOCK: …`),
   because that is how models actually answer.
+- **A denial is read in the words models deny with; an approval is not.** `BLOCKED:`,
+  `Blocked`, `Verdict: BLOCKED`, `DENY:` and `REJECT:` all count as `BLOCK`, while
+  `APPROVE` and `WARN` stay exact. The asymmetry is the point: a wider denial vocabulary
+  costs a retry, a wider approval one runs the command.
 - **Mentioning a verdict is not stating one.** A response that says `BLOCK` only in
   passing, with no verdict anywhere, is ambiguous rather than decided — so it is a failed
   call and escalates. Reading the mention as a denial made the gate fire on its own
@@ -169,9 +177,19 @@ Rules the layer enforces:
   per provider because a single tally gets it wrong both ways: a successful fallback
   would erase a dead paid vendor's failures and it would be retried on every hook, while
   a shared tally would take the working subscription reviewer down with it.
-- **In strict mode a `BLOCK` denies your tool call outright.** Routing a profile to a
-  paid vendor therefore gives that vendor a veto, not an opinion. Set
-  `CODEX_COPILOT_MODE=strict` with that in mind.
+- **In strict mode a `BLOCK` denies your tool call outright, and so does an inconclusive
+  review.** No verdict, no Codex binary, a timeout, an open breaker or a spent budget all
+  deny the pending command rather than waving it through: a gate that allows whenever its
+  reviewer is unreachable protects nothing at the moment it is needed. This applies only
+  to the commands `shouldReviewTool` flags — `rm -rf`, force-push, `sudo`,
+  `terraform apply`, `curl | sh` and friends. Unset `CODEX_COPILOT_MODE` to get advisory
+  notes instead. Routing a profile to a paid vendor also gives that vendor a veto, not an
+  opinion; set strict mode with both facts in mind.
+- **The denial is emitted in the shape the host enforces.** Hooks that answer
+  `{"decision": "deny"}` are silently ignored — the host's `decision` field is
+  `approve`/`block`, and output that fails its schema is discarded whole, so the command
+  runs. The hook sends `hookSpecificOutput.permissionDecision: "deny"` and keeps the
+  legacy `decision: "block"` alongside it.
 
 Spend is recorded in `.claude/cache/provider-spend.jsonl`, one appended line per call,
 so concurrent hooks cannot lose each other's entries. `apply-kit.sh` adds

@@ -189,7 +189,42 @@ test("mentioning the word is not deciding with it, in either direction", () => {
 
   const ambiguous = parseVerdict("On reflection I must say BLOCK, though I am unsure.");
   assert.equal(ambiguous.ok, false);
-  assert.match(ambiguous.reason, /mentioned BLOCK without stating a verdict/);
+  assert.match(ambiguous.reason, /mentioned a denial without stating a verdict/);
+});
+
+test("a denial is recognised in every word models write it with, an approval is not", () => {
+  // `BLOCKED:`, `**Blocked**`, `Verdict: BLOCKED`, `DENY:` were all read as "no verdict"
+  // while the exact token BLOCK was the only denial the gate understood. The asymmetry
+  // is the point: a wider denial vocabulary costs a retry, a wider approval one runs the
+  // command, so APPROVE and WARN stay exact.
+  for (const said of ["BLOCKED: this deletes the live database", "**Blocked** — rm -rf on live data",
+    "Verdict: BLOCKED", "DENY: unreviewable pipe to sh", "REJECT: force-push to main"]) {
+    const parsed = parseVerdict(said);
+    assert.equal(parsed.ok, true, said);
+    assert.equal(parsed.level, "BLOCK", said);
+    assert.equal(isBlockingVerdict(parsed.verdict), true, said);
+  }
+  // The detail survives without the word being repeated back into it.
+  assert.equal(parseVerdict("BLOCKED: this deletes the live database").verdict,
+    "BLOCK: this deletes the live database");
+  // Approval words stay exact: an invented one is no verdict at all, which escalates.
+  assert.equal(parseVerdict("APPROVED: looks fine").ok, false);
+});
+
+test("a refusal at the gateway gives its reservation back", () => {
+  // Holding the reservation on 401/403 recreated the exact failure the release was
+  // written to prevent: a wrong or rotated key walked the ledger to the ceiling one
+  // phantom reservation per hook and switched the paid route off, having spent $0.
+  const refuses = (status) => async () => ({ ok: false, status, json: async () => ({}) });
+  const deps = (status) => ({ fetch: refuses(status), env: { DEEPSEEK_API_KEY: "test-key" } });
+  return Promise.all([401, 403, 429].map(async (status) => {
+    const result = await runHttpProvider(PROVIDERS.deepseek, "deepseek-chat", "hi", 5, deps(status));
+    assert.equal(result.sent, false, `HTTP ${status} was refused before any model ran`);
+  })).then(async () => {
+    // A server-side failure may well have been metered, so that one still holds.
+    const result = await runHttpProvider(PROVIDERS.deepseek, "deepseek-chat", "hi", 5, deps(503));
+    assert.equal(result.sent, true);
+  });
 });
 
 test("parsing and enforcement agree on what counts as a block", () => {

@@ -60,18 +60,42 @@ const RISKY_CALL = {
   tool_input: { command: "rm -rf /var/tmp/agent-kit-not-real" },
 };
 
-test("strict mode denies the tool call on a verdict of BLOCK", async () => {
+test("strict mode denies the tool call in the shape the host enforces", async () => {
   // A detail-less `BLOCK` is what a model returns when asked for one line, and it is
   // the shape that used to slip past enforcement while parsing accepted it.
+  //
+  // The assertion is on the wire format, not on an invented one. The hook emitted
+  // `decision: "deny"`, which the host's schema rejects — its enum is approve/block —
+  // and rejected output is discarded whole, so every denial was inert while this test
+  // passed against a shape nothing consumes.
   await withProjectRoot(() => withStubbedCodex("BLOCK", "strict", async () => {
     const output = await main(RISKY_CALL);
-    assert.equal(output.decision, "deny");
-    assert.match(output.reason, /BLOCK/);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /BLOCK/);
+    assert.equal(output.decision, "block", "the legacy field must carry a value the host knows");
   }));
 
   await withProjectRoot(() => withStubbedCodex("**BLOCK** — force push to main", "strict", async () => {
     const output = await main(RISKY_CALL);
-    assert.equal(output.decision, "deny");
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+  }));
+
+  // Every word a model denies with, not only the one token the gate used to know.
+  for (const said of ["BLOCKED: this deletes the live database", "Verdict: BLOCKED", "DENY: unreviewable"]) {
+    await withProjectRoot(() => withStubbedCodex(said, "strict", async () => {
+      const output = await main(RISKY_CALL);
+      assert.equal(output.hookSpecificOutput.permissionDecision, "deny", said);
+    }));
+  }
+});
+
+test("in strict mode a review that reached no verdict denies too", async () => {
+  // Allowing here meant every way the reviewer could fail — no verdict, no binary, a
+  // timeout, an open circuit — removed the gate from `rm -rf` at the moment it mattered.
+  await withProjectRoot(() => withStubbedCodex("I would not run that, honestly.", "strict", async () => {
+    const output = await main(RISKY_CALL);
+    assert.equal(output.hookSpecificOutput.permissionDecision, "deny");
+    assert.match(output.hookSpecificOutput.permissionDecisionReason, /no APPROVE\/WARN\/BLOCK verdict/);
   }));
 });
 
@@ -142,7 +166,7 @@ test("what a metered call cost lands in the spend ledger", async () => {
       }),
     });
 
-    assert.deepEqual(note, { note: "APPROVE: nothing risky here", blocking: false });
+    assert.deepEqual(note, { note: "APPROVE: nothing risky here", blocking: false, conclusive: true });
     assert.equal(readSpentUsd(ledgerFile).toFixed(2), "0.55");
   });
 });
@@ -200,6 +224,30 @@ test("a chatty paid provider does not close the breaker on the subscription revi
     const { note, blocking } = await askCodex("tool-check", "check this", "review", 20, deps);
     assert.doesNotMatch(note, /circuit is open/);
     assert.equal(blocking, true);
+  });
+});
+
+test("a dead paid transport stops being dialled, while Codex keeps reviewing", async () => {
+  // The other half of the same rule, and the half the test above never reached: the
+  // count is kept per provider, so a paid route whose transport is down is skipped
+  // after three failures instead of being retried on every hook — and skipping it does
+  // not take the subscription reviewer down with it.
+  await withProjectRoot(async () => {
+    let attempts = 0;
+    const deps = {
+      env: PAID_ENV,
+      spawnSync: () => ({ status: 0, stdout: "BLOCK: destroys uncommitted work", stderr: "" }),
+      fetch: async () => { attempts += 1; throw new Error("connect ECONNREFUSED"); },
+    };
+
+    for (let i = 0; i < 3; i += 1) await askCodex("tool-check", "check this", "review", 20, deps);
+    assert.equal(attempts, 3, "the paid transport is tried until the breaker has seen enough");
+
+    const { note, blocking } = await askCodex("tool-check", "check this", "review", 20, deps);
+    assert.equal(attempts, 3, "and is not dialled again inside the window");
+    assert.match(note, /failed state/);
+    assert.doesNotMatch(note, /circuit is open/, "the subscription reviewer is still up");
+    assert.equal(blocking, true, "and its verdict still decides");
   });
 });
 

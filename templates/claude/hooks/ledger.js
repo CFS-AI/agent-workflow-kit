@@ -78,8 +78,9 @@ function recordSpendUsd(file, usd, at = Date.now()) {
  * only looked dead. A holder that stalls past the stale window and then wakes up would
  * otherwise write a reservation computed from a read the reclaimer has already
  * invalidated — two calls reading $0, both fitting under the ceiling, together over it.
- * So ownership is re-checked immediately before the write, and a holder that lost its
- * lease reserves nothing.
+ * So ownership is re-checked around the write — before it to skip the reservation, and
+ * after it to give one back that landed anyway — and a holder that lost its lease
+ * reserves nothing either way.
  */
 function reserveSpendUsd(file, usd, ceiling, at = Date.now()) {
   const amount = Number(usd);
@@ -120,6 +121,14 @@ function reserveSpendUsd(file, usd, ceiling, at = Date.now()) {
     }
     if (!holdsLease()) return { ok: false, reason: "paid-call reservation lost its lease" };
     fs.appendFileSync(file, `${JSON.stringify({ ts: at, usd: amount, kind: "reservation" })}\n`);
+    // Checking ownership before the write leaves the write itself unguarded: a holder
+    // descheduled between the two lines still lands a reservation the reclaimer's read
+    // never saw. Nothing has been called yet at this point, so a lease lost across the
+    // append is undone by releasing it — the money is back before it could be spent.
+    if (!holdsLease()) {
+      fs.appendFileSync(file, `${JSON.stringify({ ts: at, usd: -amount, kind: "release" })}\n`);
+      return { ok: false, reason: "paid-call reservation lost its lease" };
+    }
     return { ok: true, reservedUsd: amount };
   } finally {
     // Only ever release our own lease; the reclaimer's lock is not ours to delete.

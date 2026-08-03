@@ -133,6 +133,35 @@ test("the ceiling holds even when every lease is instantly reclaimable", async (
   }
 });
 
+test("a lease lost across the write leaves no money reserved", () => {
+  // Checking ownership before the append left the append itself unguarded: a holder
+  // descheduled between those two lines still lands a reservation the reclaimer's read
+  // never saw, and the ceiling is crossed by exactly that amount. Nothing has been
+  // called at that point, so the reservation is given back rather than defended.
+  const file = tempLedger();
+  const lockFile = `${file}.reservation-lock`;
+  const realAppend = fs.appendFileSync;
+  let stolen = false;
+  fs.appendFileSync = (target, data, ...rest) => {
+    const result = realAppend.call(fs, target, data, ...rest);
+    // The instant our reservation lands, another contender reclaims the lease.
+    if (!stolen && target === file) {
+      stolen = true;
+      fs.writeFileSync(lockFile, "another-holder");
+    }
+    return result;
+  };
+
+  try {
+    const result = reserveSpendUsd(file, 3, 5);
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /lost its lease/);
+    assert.equal(readSpentUsd(file), 0, "the reservation that landed anyway was released");
+  } finally {
+    fs.appendFileSync = realAppend;
+  }
+});
+
 test("a corrupt line does not erase the spend recorded around it", () => {
   const file = tempLedger();
   recordSpendUsd(file, 1.37);

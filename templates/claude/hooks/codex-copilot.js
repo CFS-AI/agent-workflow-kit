@@ -71,6 +71,27 @@ function shouldReviewPrompt(prompt) {
   return /(architecture|migration|deploy|production|security|risk|архитектур|миграц|деплой|прод|безопасн|риск)/i.test(prompt);
 }
 
+/**
+ * Deny a pending tool call in the shape the host actually enforces.
+ *
+ * This used to emit `{decision: "deny"}`, which is not a value the host understands:
+ * its top-level `decision` is `enum(["approve","block"])`, `"deny"` is compared nowhere,
+ * and output that fails validation is discarded whole — so the command ran. Every denial
+ * this hook has ever produced was inert. `hookSpecificOutput.permissionDecision` is the
+ * current form; `decision: "block"` is the legacy one, kept so older hosts still deny.
+ */
+function denyPreToolUse(reason) {
+  return {
+    decision: "block",
+    reason,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
+  };
+}
+
 function shouldReviewTool(tool, command) {
   return tool === "Bash" && /(rm\s+-rf|git\s+(reset\s+--hard|push\s+--force|clean\s+-fd)|sudo\s+|terraform\s+apply|npm\s+publish|curl\b.*\|\s*(bash|sh))/i.test(command);
 }
@@ -94,7 +115,11 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
   const now = Date.now();
   circuit.failures = (circuit.failures || []).filter((ts) => now - ts <= CIRCUIT_WINDOW_MS);
   if (isCircuitOpen(circuit, now)) {
-    return { note: `WARN: Codex ${kind} skipped; circuit is open after repeated failures.`, blocking: false };
+    return {
+      note: `WARN: Codex ${kind} skipped; circuit is open after repeated failures.`,
+      blocking: false,
+      conclusive: false,
+    };
   }
 
   const result = await askProvider(kind, route, prompt, {
@@ -128,7 +153,15 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
     const { total, ceiling } = result.ceilingBreached;
     notes.push(`[budget ceiling crossed on settlement: $${total.toFixed(4)} of $${ceiling}]`);
   }
-  return { note: notes.join(" "), blocking: result.ok === true && result.level === "BLOCK" };
+  // The note is the one thing that leaves this process, and it carries provider prose:
+  // a model asked to judge a command quotes that command back, keys and all. Redacting
+  // the assembled string covers the verdict, the escalation reason and the ledger note
+  // in one place; the decision below is taken from `result.level`, never from the text.
+  return {
+    note: safeReason(notes.join(" ")),
+    blocking: result.ok === true && result.level === "BLOCK",
+    conclusive: result.ok === true,
+  };
 }
 
 async function main(input) {
@@ -152,9 +185,13 @@ async function main(input) {
     const tool = String(input.tool_name || "");
     const command = String((input.tool_input || {}).command || "");
     if (!shouldReviewTool(tool, command)) return null;
-    const { note, blocking } = await askCodex("tool-check", `Review pending tool call. Return one line APPROVE/WARN/BLOCK.\nTool=${tool}\nCommand=${command}`, "review");
-    return strict && blocking
-      ? { decision: "deny", reason: note }
+    const { note, blocking, conclusive } = await askCodex("tool-check", `Review pending tool call. Return one line APPROVE/WARN/BLOCK.\nTool=${tool}\nCommand=${command}`, "review");
+    // In strict mode an inconclusive review denies. It used to allow, which meant every
+    // way the reviewer could fail — no verdict, no binary, a timeout, an open circuit, a
+    // spent budget — quietly removed the gate from `rm -rf` and force-push at exactly the
+    // moment it was needed. A strict gate that allows when its reviewer is gone is theatre.
+    return strict && (blocking || !conclusive)
+      ? denyPreToolUse(note)
       : { hookSpecificOutput: { hookEventName: eventName, additionalContext: `Codex review note: ${note}` } };
   }
 
@@ -175,11 +212,17 @@ if (require.main === module) {
       if (output) console.log(JSON.stringify(output));
     } catch (err) {
       // A hook that throws prints nothing, and printing nothing on PreToolUse silently
-      // removes the review from a destructive command. Say what broke instead.
-      console.log(JSON.stringify({
+      // removes the review from a destructive command. Printing a *note* removes it just
+      // as completely, so in strict mode a crash on a reviewed command denies like any
+      // other inconclusive review; everywhere else it says what broke.
+      const reason = `Codex copilot failed: ${safeReason(err && err.message)}`;
+      const guarded = input.hook_event_name === "PreToolUse"
+        && process.env.CODEX_COPILOT_MODE === "strict"
+        && shouldReviewTool(String(input.tool_name || ""), String((input.tool_input || {}).command || ""));
+      console.log(JSON.stringify(guarded ? denyPreToolUse(reason) : {
         hookSpecificOutput: {
           hookEventName: input.hook_event_name || "Unknown",
-          additionalContext: `Codex copilot failed: ${safeReason(err && err.message)}`,
+          additionalContext: reason,
         },
       }));
     }

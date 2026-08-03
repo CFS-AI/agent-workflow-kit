@@ -70,8 +70,22 @@ validateProviders(PROVIDERS);
  * the word ("Approve only if …") is not: the keyword has to be followed by a separator
  * or end the line.
  */
-const VERDICT_RE =
-  /^[\s>*_`#+-]*(?:[*_`]*(?:verdict|вердикт)[*_`]*\s*[:—–-][*_`\s]*)?[*_`]*(APPROVE|WARN|BLOCK)[*_`]*\s*(?:[:—–-]\s*(.*))?$/i;
+/**
+ * A denial is recognised in the shapes models actually write it; an approval is not.
+ *
+ * `BLOCKED:`, `**Blocked**`, `Verdict: BLOCKED`, `DENY:`, `REJECT:` were every one of
+ * them read as "no verdict" while the exact token `BLOCK` was the only denial the gate
+ * understood — on a gate whose whole job is to stop `rm -rf` and force-push. The
+ * asymmetry is deliberate: reading more words as a denial costs a retry, reading more
+ * words as an approval runs the command, so `APPROVE` and `WARN` stay exact.
+ */
+const DENIAL_TOKEN = "BLOCK(?:ED|ING|S)?|DENY|DENIED|DENIES|REJECT(?:ED|ING|S)?";
+
+const VERDICT_RE = new RegExp(
+  "^[\\s>*_`#+-]*(?:[*_`]*(?:verdict|вердикт)[*_`]*\\s*[:—–-][*_`\\s]*)?" +
+    `[*_\`]*(APPROVE|WARN|${DENIAL_TOKEN})[*_\`]*\\s*(?:[:—–-]\\s*(.*))?$`,
+  "i",
+);
 
 /**
  * A verdict still counts when something introduces it.
@@ -93,12 +107,15 @@ const VERDICT_LEAD_RE = /^(?:\d+[.)]\s*|[^:\n]{1,40}:\s*)/;
  * verdict anywhere is neither: the response is ambiguous, which is a failed call, which
  * escalates for a second opinion. Ambiguity costs a retry, never a run.
  */
-const BLOCK_MENTION_RE = /\bBLOCK\b/i;
+const BLOCK_MENTION_RE = new RegExp(`\\b(?:${DENIAL_TOKEN})\\b`, "i");
 
 /** Heavier verdicts win over lighter ones no matter where in the response they appear. */
 const VERDICT_SEVERITY = { APPROVE: 1, WARN: 2, BLOCK: 3 };
 
 const DEFAULT_MAX_TOKENS = 512;
+
+/** Statuses a vendor returns before any model runs: rejected at the door, never billed. */
+const GATEWAY_REFUSALS = new Set([400, 401, 402, 403, 404, 429]);
 
 /**
  * Names an actual provider, as opposed to a property every object has.
@@ -334,7 +351,14 @@ async function runHttpProvider(provider, model, prompt, timeoutSec, deps = {}) {
       }),
       signal: controller.signal,
     });
-    if (!response.ok) return { ok: false, sent: true, reason: `HTTP ${response.status}` };
+    // A refusal at the gateway is proof no model ran, so the reservation comes back.
+    // Holding it turned a wrong or rotated key into the exact failure the reservation
+    // release was written to prevent: the ledger walked to the ceiling one phantom
+    // reservation per hook and switched the paid route off for good, having spent $0.
+    // Anything else — 5xx, 408, an unknown status — may have been metered, so it holds.
+    if (!response.ok) {
+      return { ok: false, sent: !GATEWAY_REFUSALS.has(response.status), reason: `HTTP ${response.status}` };
+    }
     const body = await response.json();
     const text = String(body?.choices?.[0]?.message?.content || "").trim();
     return { ok: true, text, usage: body?.usage || null };
@@ -370,17 +394,19 @@ function parseVerdict(text) {
     // behind `Recommendation:` or `1.` is found where anchoring alone would miss it.
     const match = VERDICT_RE.exec(line) || VERDICT_RE.exec(line.replace(VERDICT_LEAD_RE, ""));
     if (!match) continue;
-    const level = match[1].toUpperCase();
+    const token = match[1].toUpperCase();
+    // Every denial word means the same thing downstream, so they all normalise to BLOCK.
+    const level = token === "APPROVE" || token === "WARN" ? token : "BLOCK";
     if (!best || VERDICT_SEVERITY[level] > VERDICT_SEVERITY[best.level]) {
-      best = { level, detail: (match[2] || "").trim() };
+      best = { level, token, detail: (match[2] || "").trim() };
     }
   }
   if (!best && BLOCK_MENTION_RE.test(body)) {
-    return { ok: false, reason: "response mentioned BLOCK without stating a verdict" };
+    return { ok: false, reason: "response mentioned a denial without stating a verdict" };
   }
   if (!best) return { ok: false, reason: "response carried no APPROVE/WARN/BLOCK verdict" };
-  // A carrier line that already opens with the level would otherwise read `BLOCK: BLOCK …`.
-  const detail = best.detail.replace(new RegExp(`^${best.level}\\b[\\s:—–-]*`, "i"), "").trim();
+  // A carrier line that already opens with the word would otherwise read `BLOCK: BLOCKED …`.
+  const detail = best.detail.replace(new RegExp(`^${best.token}\\b[\\s:—–-]*`, "i"), "").trim();
   return {
     ok: true,
     level: best.level,
