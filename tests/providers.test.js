@@ -21,6 +21,7 @@ const {
   resolveModel,
   resolveProvider,
   runHttpProvider,
+  validateProviders,
 } = require("../templates/claude/hooks/providers.js");
 
 // Production routes carry Codex model names; nothing in the hook can produce a
@@ -155,7 +156,7 @@ test("a denial is read wherever it appears, not only where a line begins", () =>
   // invisible to the gate that guards `rm -rf`.
   assert.equal(parseVerdict("APPROVE: routine\nRecommendation: **BLOCK**: destructive").level, "BLOCK");
   assert.equal(parseVerdict("WARN: minor\n1. BLOCK: rm -rf on a live path").level, "BLOCK");
-  assert.equal(parseVerdict("APPROVE — looks fine\nOn reflection I must say BLOCK").level, "BLOCK");
+  assert.equal(parseVerdict("APPROVE: fine\n2) BLOCK — touches production").level, "BLOCK");
   assert.equal(isBlockingVerdict("APPROVE: routine\nRecommendation: **BLOCK**: destructive"), true);
   // The denial carries its own line as the reason, so the operator sees what denied it.
   assert.match(parseVerdict("APPROVE: routine\nRecommendation: **BLOCK**: destructive").verdict, /destructive/);
@@ -175,8 +176,20 @@ test("reading a denial out of prose never extends to reading an approval out of 
   assert.equal(parseVerdict("I would approve this, it looks harmless enough.").ok, false);
   assert.equal(parseVerdict("There is nothing here to warn about.").ok, false);
   assert.equal(isBlockingVerdict("I would approve this, it looks harmless enough."), false);
-  // And a sentence that merely mentions the word denies, because that way round is safe.
-  assert.equal(isBlockingVerdict("This is not a BLOCK situation."), true);
+});
+
+test("mentioning the word is not deciding with it, in either direction", () => {
+  // Treating a bare mention as a denial made the gate fire on its own approvals —
+  // `APPROVE: no BLOCK condition applies` denied itself, and a gate that fires on correct
+  // approvals gets turned off. Treating it as an approval is worse. So a mention with no
+  // verdict anywhere is ambiguity: a failed call, which escalates for a second opinion.
+  assert.equal(isBlockingVerdict("APPROVE: no BLOCK condition applies; target is a scratch dir"), false);
+  assert.equal(parseVerdict("APPROVE: no BLOCK condition applies").level, "APPROVE");
+  assert.equal(parseVerdict("WARN: scoped; this is not a BLOCK situation").level, "WARN");
+
+  const ambiguous = parseVerdict("On reflection I must say BLOCK, though I am unsure.");
+  assert.equal(ambiguous.ok, false);
+  assert.match(ambiguous.reason, /mentioned BLOCK without stating a verdict/);
 });
 
 test("parsing and enforcement agree on what counts as a block", () => {
@@ -648,9 +661,97 @@ test("an HTTP provider is dispatched with its own record, not with the first one
 test("an HTTP provider that claims to be unmetered cannot exist", () => {
   // Every budget gate keys off `metered`, so an HTTP record without it would take the
   // paid transport with none of the checks. The table refuses to load instead.
-  for (const provider of Object.values(PROVIDERS)) {
-    if (provider.kind === "http") assert.equal(provider.metered, true);
+  assert.throws(
+    () => validateProviders({ rogue: { kind: "http", metered: false, endpoint: "https://x", apiKeyEnv: "X" } }),
+    /without being metered/,
+  );
+  assert.doesNotThrow(() => validateProviders(PROVIDERS));
+});
+
+test("a denial survives an answer the ledger cannot price", async () => {
+  // The cost gate ran before the answer was read, so a paid reviewer that denied the
+  // command while omitting `usage` had its denial thrown away and replaced by whatever
+  // the fallback said. Unmeasurable spend is a billing problem; it is not a reason to run
+  // a command a reviewer refused.
+  for (const usage of [undefined, {}, { prompt_tokens: 0, completion_tokens: 0 }]) {
+    const result = await askProvider(
+      "tool-check",
+      ROUTE,
+      "rm -rf /srv",
+      { provider: "deepseek", profile: "review" },
+      {
+        env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+        fetch: fakeFetch({ choices: [{ message: { content: "BLOCK: destroys production data" } }], usage }),
+        spawnSync: () => ({ status: 0, stdout: "APPROVE: fallback says okay", stderr: "" }),
+      },
+    );
+
+    assert.equal(result.level, "BLOCK", `usage ${JSON.stringify(usage)} lost the denial`);
+    assert.equal(isBlockingVerdict(result.verdict), true);
+    assert.match(result.verdict, /destroys production data/);
+    // The escalation is still reported, and the worst case is still charged.
+    assert.equal(result.escalatedFrom, "deepseek");
+    assert.ok(result.costUsd > 0);
   }
+});
+
+test("a fallback that denies is not softened by the provider that approved", async () => {
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "rm -rf /srv",
+    { provider: "deepseek", profile: "review" },
+    {
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+      fetch: fakeFetch({ choices: [{ message: { content: "APPROVE: seems fine" } }] }),
+      spawnSync: () => ({ status: 0, stdout: "BLOCK: destroys uncommitted work", stderr: "" }),
+    },
+  );
+
+  assert.equal(result.level, "BLOCK");
+  assert.match(result.verdict, /uncommitted/);
+});
+
+test("a paid transport that is down is not retried on every hook", async () => {
+  let attempts = 0;
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    {
+      provider: "deepseek",
+      profile: "review",
+      providerUnavailable: (name) => name === "deepseek",
+    },
+    {
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+      fetch: async () => { attempts += 1; throw new Error("must not be called"); },
+      spawnSync: codexOk,
+    },
+  );
+
+  assert.equal(attempts, 0);
+  assert.equal(result.provider, "codex");
+  assert.match(result.escalationReason, /failed state/);
+});
+
+test("a transport failure is reported under the provider that suffered it", async () => {
+  const result = await askProvider(
+    "tool-check",
+    ROUTE,
+    "check this",
+    { provider: "deepseek", profile: "review" },
+    {
+      env: { ...PAID_ENV, AGENT_KIT_ALLOW_EXTERNAL_PROMPTS: "1" },
+      fetch: fakeFetch({}, { ok: false, status: 503 }),
+      spawnSync: codexOk,
+    },
+  );
+
+  // A successful fallback used to erase the fact that the paid transport was down.
+  assert.equal(result.originTransportFailed, "deepseek");
+  assert.equal(result.ok, true);
+  assert.equal(result.transportFailed, undefined);
 });
 
 test("the unmetered provider has nowhere to escalate and reports plainly", async () => {

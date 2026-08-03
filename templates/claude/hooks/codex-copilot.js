@@ -32,6 +32,19 @@ function isCircuitOpen(state, now = Date.now()) {
   return failures.length >= CIRCUIT_FAILURES;
 }
 
+/**
+ * Whether one provider's transport has failed often enough to stop trying it.
+ *
+ * Kept per provider on purpose. A single counter meant a dead paid vendor on one profile
+ * either went unnoticed — a successful fallback erased the failure, so it was retried on
+ * every hook forever — or, counted globally, took the working subscription reviewer down
+ * with it on every other profile.
+ */
+function isProviderCircuitOpen(state, provider, now = Date.now()) {
+  const failures = ((state.providers || {})[provider] || []).filter((ts) => now - ts <= CIRCUIT_WINDOW_MS);
+  return failures.length >= CIRCUIT_FAILURES;
+}
+
 function readCircuit(file) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); }
   catch { return { failures: [] }; }
@@ -90,6 +103,7 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
     spentUsd: readSpentUsd(ledgerFile),
     reserveSpend: (usd, ceiling) => reserveSpendUsd(ledgerFile, usd, ceiling),
     settleSpend: (reservedUsd, actualUsd) => settleReservedSpendUsd(ledgerFile, reservedUsd, actualUsd),
+    providerUnavailable: (name) => isProviderCircuitOpen(circuit, name, now),
   }, deps);
 
   // The breaker exists to stop hammering a transport that is down, so only a transport
@@ -98,6 +112,11 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {
   // every profile, including the ones still on the subscription.
   if (result.transportFailed) circuit.failures.push(now);
   else circuit.failures = [];
+  if (result.originTransportFailed) {
+    circuit.providers = circuit.providers || {};
+    const seen = (circuit.providers[result.originTransportFailed] || []).filter((ts) => now - ts <= CIRCUIT_WINDOW_MS);
+    circuit.providers[result.originTransportFailed] = [...seen, now];
+  }
   writeCircuit(circuitFile, circuit);
   // Reserved paid spend is already in the shared ledger; unreserved fallback costs
   // are recorded here. This keeps concurrent hooks below one ceiling.
@@ -167,4 +186,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { PROFILES, askCodex, choosePlanningProfile, isCircuitOpen, main };
+module.exports = { PROFILES, askCodex, choosePlanningProfile, isCircuitOpen, isProviderCircuitOpen, main };

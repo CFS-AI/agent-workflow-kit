@@ -146,19 +146,29 @@ Rules the layer enforces:
   consumed nothing — so no vendor can buy unlimited calls for $0.
 - **A response without an `APPROVE`/`WARN`/`BLOCK` verdict is a failed call**, not a
   quiet approval, and the prose is never passed on dressed as a verdict.
-- **The heaviest verdict wins, and denial is read the most generously.** `BLOCK`
-  outranks `WARN` outranks `APPROVE`, and markdown decoration (`**BLOCK**:`, `- BLOCK —`,
-  `**Verdict:** BLOCK`) is read as a verdict, because that is how models actually answer.
-  A denial counts anywhere in the response, including mid-sentence; an approval has to
-  stand as its own line. The asymmetry is deliberate: on a gate guarding `rm -rf` a
-  missed denial runs the command, while a denial read out of prose only costs a retry.
+- **The heaviest verdict wins.** `BLOCK` outranks `WARN` outranks `APPROVE`, and markdown
+  decoration (`**BLOCK**:`, `- BLOCK —`, `**Verdict:** BLOCK`) is read as a verdict, as is
+  a verdict behind whatever introduced it (`Recommendation: BLOCK: …`, `1. BLOCK: …`),
+  because that is how models actually answer.
+- **Mentioning a verdict is not stating one.** A response that says `BLOCK` only in
+  passing, with no verdict anywhere, is ambiguous rather than decided — so it is a failed
+  call and escalates. Reading the mention as a denial made the gate fire on its own
+  approvals (`APPROVE: no BLOCK condition applies`), and a gate that fires on correct
+  approvals gets switched off; reading it as an approval runs the command. Ambiguity
+  costs a retry instead.
+- **A denial outlives the accounting.** A paid answer with no usable `usage` is discarded
+  as unmeasurable — except for a `BLOCK` in it, which is kept and still denies. Billing
+  and safety are separate facts, and the fallback is never allowed to soften a denial the
+  first reviewer already made.
 - **Any of the above escalates to the subscription provider**, reporting what it
   escalated from and why. Escalation is never silent, and the decision to deny is taken
   on the provider's own verdict, never re-read out of the note built for display.
-- **The breaker counts transports, not opinions.** Three failed *transports* in five
-  minutes stop the copilot for the rest of the window. A reviewer that answered without a
-  verdict is alive, so it does not count — otherwise one talkative paid provider on one
-  profile would disable review on every profile, including the ones still on Codex.
+- **The breaker counts transports, not opinions, and counts them per provider.** Three
+  failed *transports* in five minutes stop that provider for the rest of the window. A
+  reviewer that answered without a verdict is alive, so it does not count. The count is
+  per provider because a single tally gets it wrong both ways: a successful fallback
+  would erase a dead paid vendor's failures and it would be retried on every hook, while
+  a shared tally would take the working subscription reviewer down with it.
 - **In strict mode a `BLOCK` denies your tool call outright.** Routing a profile to a
   paid vendor therefore gives that vendor a veto, not an opinion. Set
   `CODEX_COPILOT_MODE=strict` with that in mind.

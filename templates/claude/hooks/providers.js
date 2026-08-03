@@ -45,14 +45,21 @@ const PROVIDERS = {
   },
 };
 
-// An HTTP provider bills per call by definition, and every budget gate keys off
-// `metered`. A record that says otherwise would take the paid transport with none of the
-// checks, so the contradiction is refused at load time rather than discovered by a bill.
-for (const [name, provider] of Object.entries(PROVIDERS)) {
-  if (provider.kind === "http" && !provider.metered) {
-    throw new Error(`provider ${name} declares an HTTP transport without being metered`);
+/**
+ * An HTTP provider bills per call by definition, and every budget gate keys off
+ * `metered`. A record that says otherwise would take the paid transport with none of the
+ * checks, so the contradiction is refused at load time rather than discovered by a bill.
+ */
+function validateProviders(table) {
+  for (const [name, provider] of Object.entries(table)) {
+    if (provider.kind === "http" && !provider.metered) {
+      throw new Error(`provider ${name} declares an HTTP transport without being metered`);
+    }
   }
+  return table;
 }
+
+validateProviders(PROVIDERS);
 
 /**
  * The one shape a verdict may take, used for both parsing and enforcement.
@@ -67,16 +74,26 @@ const VERDICT_RE =
   /^[\s>*_`#+-]*(?:[*_`]*(?:verdict|вердикт)[*_`]*\s*[:—–-][*_`\s]*)?[*_`]*(APPROVE|WARN|BLOCK)[*_`]*\s*(?:[:—–-]\s*(.*))?$/i;
 
 /**
- * A denial counts wherever it appears, including in the middle of a sentence.
+ * A verdict still counts when something introduces it.
  *
- * The line-anchored form above is right for APPROVE and WARN — prose must never be able
- * to manufacture an approval — and wrong for BLOCK, asymmetrically so. `APPROVE:
- * routine\nRecommendation: **BLOCK**: destructive` parsed as APPROVE, and on a gate that
- * guards `rm -rf`, force-push and `terraform apply` a missed denial is a fail-open while
- * a denial read out of prose is only noise. So BLOCK is matched against the whole
- * response and outranks whatever the line parser found.
+ * Anchoring to the start of a line lost every denial a model wrote as a recommendation
+ * or a numbered step — `Recommendation: **BLOCK**: destructive`, `1. BLOCK: rm -rf` —
+ * on a gate that guards `rm -rf`, force-push and `terraform apply`. So a leading label
+ * or list marker is stripped and the line is read again.
  */
-const BLOCK_ANYWHERE_RE = /\bBLOCK\b/i;
+const VERDICT_LEAD_RE = /^(?:\d+[.)]\s*|[^:\n]{1,40}:\s*)/;
+
+/**
+ * The word appearing somewhere in the prose, which is not the same as a verdict.
+ *
+ * Reading a bare mention as a denial looked safe — a false denial is only noise, a missed
+ * one runs the command — until you count how models write: `APPROVE: no BLOCK condition
+ * applies` denied itself, and a gate that fires on correct approvals is a gate that gets
+ * turned off. Reading it as an approval is worse still. So a mention with no structural
+ * verdict anywhere is neither: the response is ambiguous, which is a failed call, which
+ * escalates for a second opinion. Ambiguity costs a retry, never a run.
+ */
+const BLOCK_MENTION_RE = /\bBLOCK\b/i;
 
 /** Heavier verdicts win over lighter ones no matter where in the response they appear. */
 const VERDICT_SEVERITY = { APPROVE: 1, WARN: 2, BLOCK: 3 };
@@ -349,17 +366,17 @@ function parseVerdict(text) {
   const lines = body.split("\n").map((line) => line.trim());
   let best = null;
   for (const line of lines) {
-    const match = VERDICT_RE.exec(line);
+    // Read the line, then read it again without whatever introduced it, so a verdict
+    // behind `Recommendation:` or `1.` is found where anchoring alone would miss it.
+    const match = VERDICT_RE.exec(line) || VERDICT_RE.exec(line.replace(VERDICT_LEAD_RE, ""));
     if (!match) continue;
     const level = match[1].toUpperCase();
     if (!best || VERDICT_SEVERITY[level] > VERDICT_SEVERITY[best.level]) {
       best = { level, detail: (match[2] || "").trim() };
     }
   }
-  if ((!best || best.level !== "BLOCK") && BLOCK_ANYWHERE_RE.test(body)) {
-    // The carrier line goes in as the detail so the operator sees what denied the call,
-    // rather than a bare BLOCK with no stated reason.
-    best = { level: "BLOCK", detail: lines.find((line) => BLOCK_ANYWHERE_RE.test(line)) || "" };
+  if (!best && BLOCK_MENTION_RE.test(body)) {
+    return { ok: false, reason: "response mentioned BLOCK without stating a verdict" };
   }
   if (!best) return { ok: false, reason: "response carried no APPROVE/WARN/BLOCK verdict" };
   // A carrier line that already opens with the level would otherwise read `BLOCK: BLOCK …`.
@@ -398,20 +415,37 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
   const model = resolveModel(providerName, route, options.profile);
   let reservedUsd = 0;
   let ceilingBreached = null;
+  let originTransportFailed = false;
 
-  const escalate = async (reason, costUsd = 0) => {
+  /**
+   * Hand the turn to the subscription provider, keeping any denial the first one made.
+   *
+   * A provider whose answer is unusable for billing still said something about safety.
+   * Discarding an APPROVE that cannot be measured is the point of the rule; discarding a
+   * BLOCK is a fail-open, and it was a reachable one — a paid reviewer that denied the
+   * command while omitting `usage` had its denial replaced by the fallback's approval.
+   * So the escalated result is the heavier of the two verdicts, never the lighter.
+   */
+  const escalate = async (reason, costUsd = 0, denialFromOrigin = null) => {
     const fallback = await askProvider(kind, route, prompt, { ...options, provider: DEFAULT_PROVIDER }, deps);
+    const keepDenial = denialFromOrigin
+      && (!fallback.ok || VERDICT_SEVERITY[fallback.level] < VERDICT_SEVERITY.BLOCK);
     return {
       ...fallback,
+      ...(keepDenial ? { ok: true, level: "BLOCK", verdict: denialFromOrigin } : {}),
       costUsd,
       ...(reservedUsd > 0 ? { reservedUsd } : {}),
       ...(ceilingBreached ? { ceilingBreached } : {}),
+      ...(originTransportFailed ? { originTransportFailed: providerName } : {}),
       escalatedFrom: providerName,
       escalationReason: reason,
     };
   };
 
   if (provider.metered) {
+    if (typeof options.providerUnavailable === "function" && options.providerUnavailable(providerName)) {
+      return escalate(`${providerName} transport is in a failed state; not retried`);
+    }
     if (env.AGENT_KIT_ALLOW_EXTERNAL_PROMPTS !== "1") {
       return escalate("external prompt transfer is not acknowledged (set AGENT_KIT_ALLOW_EXTERNAL_PROMPTS=1)");
     }
@@ -439,6 +473,10 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
       options.settleSpend(reservedUsd, 0);
       reservedUsd = 0;
     }
+    // The breaker exists to stop hammering a transport that is down. A successful
+    // fallback used to erase that fact, so a dead paid provider was retried on every
+    // hook forever; the failure is carried out under its own provider's name.
+    originTransportFailed = true;
     if (providerName !== DEFAULT_PROVIDER) return escalate(raw.reason);
     return {
       ok: false,
@@ -448,16 +486,24 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
     };
   }
 
+  // Read the answer before the accounting does. What the reviewer said about the command
+  // and what the call cost are separate facts, and only one of them is about safety.
+  const parsed = parseVerdict(raw.text);
+  const denial = parsed.ok && parsed.level === "BLOCK" ? parsed.verdict : null;
+
   let costUsd = 0;
   if (provider.metered) {
     const measured = estimateCostUsd(model, raw.usage, loadPrices(env));
     if (measured == null) {
       // An unmeasurable cost is UNKNOWN, never zero. The answer is unusable, and the
       // worst case bounded before the call is charged so the ceiling still moves —
-      // otherwise a provider that omits `usage` buys unlimited calls for $0.
+      // otherwise a provider that omits `usage` buys unlimited calls for $0. A denial it
+      // carried is kept even so: unmeasurable spend is a billing problem, not a reason to
+      // let a command through that a reviewer refused.
       return escalate(
         `${providerName} returned no usable usage — spend is unmeasurable`,
         projectedCostUsd(model, prompt, env) || 0,
+        denial,
       );
     }
     costUsd = measured;
@@ -473,7 +519,6 @@ async function askProvider(kind, route, prompt, options = {}, deps = {}) {
     }
   }
 
-  const parsed = parseVerdict(raw.text);
   if (!parsed.ok) {
     // A response without a verdict is a failed call like any other, so it escalates to
     // the subscription provider instead of being handed back as a WARN nobody can act
@@ -516,4 +561,5 @@ module.exports = {
   runCodex,
   runHttpProvider,
   safeReason,
+  validateProviders,
 };
