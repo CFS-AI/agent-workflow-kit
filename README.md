@@ -77,12 +77,39 @@ A paid HTTP provider (DeepSeek) can serve individual profiles, but it is opt-in 
 guarded, because it changes two things at once: calls cost money, and the answer can
 come back as prose instead of a verdict.
 
+### What leaves your machine
+
+Read this before enabling a paid provider. Routing a profile to one sends that
+vendor's API, over the public internet, **the raw text it is asked to judge**:
+
+- on `UserPromptSubmit` — the user prompt, verbatim;
+- on `PreToolUse` — the tool name and the pending shell command, verbatim.
+
+Nothing is redacted, summarised or truncated on the way out, and there is no
+allowlist of what a prompt may contain: repository paths, hostnames, ticket numbers,
+stack traces and anything pasted into the turn go with it. The Codex default keeps
+this traffic inside a subscription you already have; DeepSeek is a third party under
+its own jurisdiction, retention and training policy. Move a profile onto it only for
+repositories whose prompts and commands you are willing to disclose to that vendor.
+
+### Configuration
+
 ```bash
 export AGENT_KIT_PROVIDER_REVIEW=deepseek         # move one profile, not all of them
 export DEEPSEEK_API_KEY=...                       # never committed; read at call time
 export AGENT_KIT_BUDGET_USD=5                     # required — no ceiling, no metered call
-export AGENT_KIT_MODEL_PRICES='{"deepseek-chat":{"in":0.27,"out":1.1}}'
+export AGENT_KIT_MODEL_PRICES='{"deepseek-reasoner":{"in":0.55,"out":2.19}}'
+export AGENT_KIT_MAX_TOKENS=512                   # optional; bounds response length and cost
 ```
+
+Routing produces Codex model names (`gpt-5.6-terra`), which mean nothing to a paid
+vendor, so each provider declares its own model per profile: `prime`, `plan` and
+`review` go to `deepseek-reasoner`, `build` and `simple` to `deepseek-chat`. Price the
+**provider's** model names in `AGENT_KIT_MODEL_PRICES`, never the Codex ones.
+
+`AGENT_KIT_MAX_TOKENS` is the only bound on how long — and so how expensive — a single
+response can be. It defaults to 512, and an unparseable value falls back to that
+default rather than removing the bound.
 
 Rules the layer enforces:
 
@@ -90,10 +117,24 @@ Rules the layer enforces:
   silently recorded at $0 is how a budget goes blind, so the call is refused instead.
 - **No ceiling, no metered call.** `AGENT_KIT_BUDGET_USD` is required, and spend
   accrues across turns so the ceiling bounds the routine rather than one call.
+- **The ceiling is a limit, not a trigger.** A call is refused when its worst case —
+  the prompt as sent, plus `AGENT_KIT_MAX_TOKENS` of output — would carry the total
+  past the ceiling, so the ceiling cannot be crossed by the call that tests it.
+- **A response with no usable `usage` block is a failed call.** Unmeasurable spend is
+  unknown, never zero: the answer is discarded and the worst case is charged, so a
+  vendor that omits `usage` cannot buy unlimited calls for $0.
 - **A response without an `APPROVE`/`WARN`/`BLOCK` verdict is a failed call**, not a
   quiet approval, and the prose is never passed on dressed as a verdict.
+- **The heaviest verdict wins.** `BLOCK` outranks `WARN` outranks `APPROVE` wherever
+  each appears in the response, and markdown decoration (`**BLOCK**:`, `- BLOCK —`)
+  is read as a verdict, because that is how models actually answer.
 - **Any of the above escalates to the subscription provider**, reporting what it
   escalated from and why. Escalation is never silent.
+
+Spend is recorded in `.claude/cache/provider-spend.jsonl`, appended under a lock so
+concurrent hooks cannot lose each other's entries. `apply-kit.sh` adds
+`.claude/cache/` to the target's `.gitignore`; keep it there, since a committed
+ledger both leaks usage and resets the ceiling on merge.
 
 Prices in the example above are placeholders — declare the ones you have actually
 verified with the vendor. Verify the layer with `node --test tests/*.test.js`: the

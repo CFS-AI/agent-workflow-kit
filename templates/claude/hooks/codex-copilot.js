@@ -3,7 +3,8 @@
 
 const fs = require("fs");
 const path = require("path");
-const { askProvider } = require("./providers.js");
+const { askProvider, isBlockingVerdict } = require("./providers.js");
+const { readSpentUsd, recordSpendUsd } = require("./ledger.js");
 
 const PROFILES = {
   prime: { model: "gpt-5.6-sol", effort: "xhigh" },
@@ -56,10 +57,12 @@ function shouldReviewTool(tool, command) {
   return tool === "Bash" && /(rm\s+-rf|git\s+(reset\s+--hard|push\s+--force|clean\s+-fd)|sudo\s+|terraform\s+apply|npm\s+publish|curl\b.*\|\s*(bash|sh))/i.test(command);
 }
 
-async function askCodex(kind, prompt, profile = "review", timeout = 20) {
+async function askCodex(kind, prompt, profile = "review", timeout = 20, deps = {}) {
   const route = PROFILES[profile] || PROFILES.review;
   const projectRoot = process.env.CLAUDE_PROJECT_DIR || path.resolve(__dirname, "..", "..");
-  const circuitFile = path.join(projectRoot, ".claude", "cache", "codex-copilot-circuit.json");
+  const cacheDir = path.join(projectRoot, ".claude", "cache");
+  const circuitFile = path.join(cacheDir, "codex-copilot-circuit.json");
+  const ledgerFile = path.join(cacheDir, "provider-spend.jsonl");
   const circuit = readCircuit(circuitFile);
   const now = Date.now();
   circuit.failures = (circuit.failures || []).filter((ts) => now - ts <= CIRCUIT_WINDOW_MS);
@@ -68,14 +71,15 @@ async function askCodex(kind, prompt, profile = "review", timeout = 20) {
   const result = await askProvider(kind, route, prompt, {
     profile,
     timeoutSec: timeout,
-    spentUsd: Number(circuit.spentUsd || 0),
-  });
+    spentUsd: readSpentUsd(ledgerFile),
+  }, deps);
 
   if (result.ok) circuit.failures = [];
   else circuit.failures.push(now);
-  // Spend accrues across turns, so the ceiling bounds the routine rather than one call.
-  if (result.costUsd) circuit.spentUsd = Number(circuit.spentUsd || 0) + result.costUsd;
   writeCircuit(circuitFile, circuit);
+  // Spend accrues across turns, so the ceiling bounds the routine rather than one call.
+  // Concurrent hooks share the ledger, which is why the write is serialised there.
+  if (result.costUsd) recordSpendUsd(ledgerFile, result.costUsd);
 
   return result.escalatedFrom
     ? `${result.verdict} [escalated from ${result.escalatedFrom}: ${result.escalationReason}]`
@@ -104,7 +108,7 @@ async function main(input) {
     const command = String((input.tool_input || {}).command || "");
     if (!shouldReviewTool(tool, command)) return null;
     const note = await askCodex("tool-check", `Review pending tool call. Return one line APPROVE/WARN/BLOCK.\nTool=${tool}\nCommand=${command}`, "review");
-    return strict && /^BLOCK:/i.test(note)
+    return strict && isBlockingVerdict(note)
       ? { decision: "deny", reason: note }
       : { hookSpecificOutput: { hookEventName: eventName, additionalContext: `Codex review note: ${note}` } };
   }
@@ -126,4 +130,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { PROFILES, choosePlanningProfile, isCircuitOpen, main };
+module.exports = { PROFILES, askCodex, choosePlanningProfile, isCircuitOpen, main };

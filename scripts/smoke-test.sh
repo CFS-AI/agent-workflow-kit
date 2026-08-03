@@ -32,6 +32,7 @@ required=(
   ".claude/hooks/skill-activation.js"
   ".claude/hooks/codex-copilot.js"
   ".claude/hooks/providers.js"
+  ".claude/hooks/ledger.js"
   ".claude/skills/codex-delegate/SKILL.md"
   ".scaffold/context.md"
   ".scaffold/rules.md"
@@ -78,6 +79,10 @@ node -e "
   const p = require('$DEMO/project/.claude/hooks/providers.js');
   if (p.resolveProvider('review', {}) !== 'codex') { console.error('default routing is not codex'); process.exit(1); }
 "
+# A spend ledger must never become a commit.
+grep -qxF '.claude/cache/' "$DEMO/project/.gitignore"
+"$ROOT/scripts/apply-kit.sh" "$DEMO/project" >>/tmp/agent-workflow-apply.log
+test "$(grep -cxF '.claude/cache/' "$DEMO/project/.gitignore")" = "1"
 grep -q 'gpt-5.6-sol' "$DEMO/project/.claude/skills/codex-delegate/SKILL.md"
 grep -q 'autonomous-work-loop' "$DEMO/project/.scaffold/skills/catalog.json"
 
