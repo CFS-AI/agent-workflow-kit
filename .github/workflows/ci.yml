@@ -1,0 +1,7 @@
+name: CI
+
+on: [pull_request]
+
+jobs:
+  ci:
+    uses: CFS-AI/cfs-harness/.github/workflows/ci-static.yml@main
