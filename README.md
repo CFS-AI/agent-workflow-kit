@@ -101,7 +101,14 @@ export AGENT_KIT_ALLOW_EXTERNAL_PROMPTS=1         # explicit acknowledgement of 
 export AGENT_KIT_BUDGET_USD=5                     # required — no ceiling, no metered call
 export AGENT_KIT_MODEL_PRICES='{"deepseek-reasoner":{"in":0.55,"out":2.19}}'
 export AGENT_KIT_MAX_TOKENS=512                   # optional; bounds response length and cost
+export AGENT_KIT_LEDGER_STALE_MS=5000             # optional; how long a spend-ledger lock may sit
 ```
+
+`AGENT_KIT_LEDGER_STALE_MS` is how long a ledger lock may go untouched before another
+hook may reclaim it. The default of 5000 is three orders of magnitude above what a hold
+costs (one read plus one append), so it exists to stop a dead process wedging the ledger,
+not as a tuning knob. Setting it to `0` makes every lock instantly reclaimable, which
+switches the mutual exclusion off — the tests use that deliberately; nothing else should.
 
 `AGENT_KIT_PROVIDER_<PROFILE>` moves exactly the profile it names. `AGENT_KIT_PROVIDER`
 without a suffix moves **every** profile, including ones added to the kit later, and a
@@ -158,12 +165,18 @@ Rules the layer enforces:
   `Blocked`, `Verdict: BLOCKED`, `DENY:` and `REJECT:` all count as `BLOCK`, while
   `APPROVE` and `WARN` stay exact. The asymmetry is the point: a wider denial vocabulary
   costs a retry, a wider approval one runs the command.
+- **The same asymmetry applies to position.** A denial counts on any line, including
+  behind whatever introduced it. An approval counts only on the first or last line and
+  never behind a label, because the reviewer is handed the pending command verbatim and
+  quotes it back: a command carrying its own `APPROVE:` line otherwise approved itself,
+  as did prose like `A reviewer may answer:` / `> Verdict: APPROVE` / `I refuse this one`.
 - **Mentioning a verdict is not stating one.** A response that says `BLOCK` only in
   passing, with no verdict anywhere, is ambiguous rather than decided — so it is a failed
   call and escalates. Reading the mention as a denial made the gate fire on its own
   approvals (`APPROVE: no BLOCK condition applies`), and a gate that fires on correct
   approvals gets switched off; reading it as an approval runs the command. Ambiguity
-  costs a retry instead.
+  escalates for a second opinion instead — and if that is inconclusive too, strict mode
+  denies rather than guessing.
 - **A denial outlives the accounting.** A paid answer with no usable `usage` is discarded
   as unmeasurable — except for a `BLOCK` in it, which is kept and still denies. Billing
   and safety are separate facts, and the fallback is never allowed to soften a denial the

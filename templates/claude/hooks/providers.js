@@ -48,7 +48,12 @@ const PROVIDERS = {
 /**
  * An HTTP provider bills per call by definition, and every budget gate keys off
  * `metered`. A record that says otherwise would take the paid transport with none of the
- * checks, so the contradiction is refused at load time rather than discovered by a bill.
+ * checks, so the contradiction is refused rather than discovered by a bill.
+ *
+ * Checked on use, not on load. Throwing while the module is being required happens
+ * before the hook's own error handling exists, so a mistyped provider — which the README
+ * invites people to add — printed nothing at all and removed the review from the very
+ * commands it guards. On use, the same throw is caught and, in strict mode, denies.
  */
 function validateProviders(table) {
   for (const [name, provider] of Object.entries(table)) {
@@ -58,8 +63,6 @@ function validateProviders(table) {
   }
   return table;
 }
-
-validateProviders(PROVIDERS);
 
 /**
  * The one shape a verdict may take, used for both parsing and enforcement.
@@ -81,9 +84,13 @@ validateProviders(PROVIDERS);
  */
 const DENIAL_TOKEN = "BLOCK(?:ED|ING|S)?|DENY|DENIED|DENIES|REJECT(?:ED|ING|S)?";
 
+// Every decoration run is bounded. Unbounded adjacent quantifiers over overlapping
+// classes backtrack quadratically: a line of 32k leading `*` took two seconds to reject,
+// and `codex exec` will hand over a megabyte on one line, which is minutes of a hung
+// turn. Real decoration is a handful of characters; a bound costs nothing to recognise.
 const VERDICT_RE = new RegExp(
-  "^[\\s>*_`#+-]*(?:[*_`]*(?:verdict|вердикт)[*_`]*\\s*[:—–-][*_`\\s]*)?" +
-    `[*_\`]*(APPROVE|WARN|${DENIAL_TOKEN})[*_\`]*\\s*(?:[:—–-]\\s*(.*))?$`,
+  "^[\\s>*_`#+-]{0,24}(?:[*_`]{0,8}(?:verdict|вердикт)[*_`]{0,8}\\s{0,8}[:—–-][*_`\\s]{0,8})?" +
+    `[*_\`]{0,8}(APPROVE|WARN|${DENIAL_TOKEN})[*_\`]{0,8}\\s{0,8}(?:[:—–-]\\s{0,8}(.*))?$`,
   "i",
 );
 
@@ -315,7 +322,12 @@ function runCodex(route, prompt, timeoutSec, deps = {}) {
   );
   if (result.error) return { ok: false, reason: result.error.message };
   if (result.status !== 0) return { ok: false, reason: `exited with status ${result.status}` };
-  const text = (result.stdout || result.stderr || "").trim();
+  // Only stdout is the answer. `codex exec` writes its transcript to stderr, and that
+  // transcript echoes the prompt — which always contains "APPROVE/WARN/BLOCK". Falling
+  // back to stderr therefore let an empty answer parse as a verdict quoted out of our
+  // own instructions. An empty stdout on a clean exit is no verdict, which escalates.
+  const text = String(result.stdout || "").trim();
+  if (!text) return { ok: false, reason: "exited without printing an answer" };
   return { ok: true, text, usage: null };
 }
 
@@ -387,30 +399,41 @@ async function runHttpProvider(provider, model, prompt, timeoutSec, deps = {}) {
  */
 function parseVerdict(text) {
   const body = String(text || "");
-  const lines = body.split("\n").map((line) => line.trim());
+  const lines = body.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  const edge = (index) => index === 0 || index === lines.length - 1;
   let best = null;
-  for (const line of lines) {
+  lines.forEach((line, index) => {
     // Read the line, then read it again without whatever introduced it, so a verdict
     // behind `Recommendation:` or `1.` is found where anchoring alone would miss it.
-    const match = VERDICT_RE.exec(line) || VERDICT_RE.exec(line.replace(VERDICT_LEAD_RE, ""));
-    if (!match) continue;
+    const direct = VERDICT_RE.exec(line);
+    const introduced = direct ? null : VERDICT_RE.exec(line.replace(VERDICT_LEAD_RE, ""));
+    const match = direct || introduced;
+    if (!match) return;
     const token = match[1].toUpperCase();
     // Every denial word means the same thing downstream, so they all normalise to BLOCK.
     const level = token === "APPROVE" || token === "WARN" ? token : "BLOCK";
+    // The same asymmetry, applied to position. A denial counts wherever it appears; an
+    // approval counts only where a one-line answer actually lands — the first or last
+    // line — and never behind a label. The response quotes the very command under
+    // review, so a command carrying its own `APPROVE:` line used to approve itself,
+    // as did prose like `A reviewer may answer:` / `> Verdict: APPROVE` / `I refuse`.
+    if (level !== "BLOCK" && (introduced || !edge(index))) return;
     if (!best || VERDICT_SEVERITY[level] > VERDICT_SEVERITY[best.level]) {
       best = { level, token, detail: (match[2] || "").trim() };
     }
-  }
+  });
   if (!best && BLOCK_MENTION_RE.test(body)) {
     return { ok: false, reason: "response mentioned a denial without stating a verdict" };
   }
   if (!best) return { ok: false, reason: "response carried no APPROVE/WARN/BLOCK verdict" };
-  // A carrier line that already opens with the word would otherwise read `BLOCK: BLOCKED …`.
-  const detail = best.detail.replace(new RegExp(`^${best.token}\\b[\\s:—–-]*`, "i"), "").trim();
+  // The detail is whatever followed the separator, verbatim. It used to be stripped of a
+  // leading copy of the verdict word, which was only ever needed by a carrier line that
+  // no longer exists — and it silently ate a word out of real reasons
+  // (`WARN: warn the operator` became `WARN: the operator`).
   return {
     ok: true,
     level: best.level,
-    verdict: detail ? `${best.level}: ${detail}` : best.level,
+    verdict: best.detail ? `${best.level}: ${best.detail}` : best.level,
   };
 }
 
@@ -434,6 +457,7 @@ function isBlockingVerdict(text) {
  * turn. Escalation is reported, never silent: the caller sees which provider answered.
  */
 async function askProvider(kind, route, prompt, options = {}, deps = {}) {
+  validateProviders(PROVIDERS);
   const env = deps.env || process.env;
   const providerName = knownProvider(options.provider) || resolveProvider(options.profile, env);
   const provider = PROVIDERS[providerName];
