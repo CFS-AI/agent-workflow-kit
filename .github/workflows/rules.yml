@@ -4,4 +4,8 @@ on: [pull_request]
 
 jobs:
   rules:
-    uses: CFS-AI/cfs-harness/.github/workflows/rules-sync.yml@main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmp --silent CLAUDE.md AGENTS.md
+      - run: ./scripts/scrub-check.sh

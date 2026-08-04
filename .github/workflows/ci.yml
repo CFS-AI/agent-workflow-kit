@@ -4,4 +4,12 @@ on: [pull_request]
 
 jobs:
   ci:
-    uses: CFS-AI/cfs-harness/.github/workflows/ci-static.yml@main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test tests/*.test.js
+      - run: ./scripts/smoke-test.sh
+      - run: ./scripts/scrub-check.sh
