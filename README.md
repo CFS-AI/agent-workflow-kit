@@ -69,6 +69,15 @@ Then customize placeholders marked `TODO:`.
 4. **One writer per worktree.** Parallel agents get isolated git worktrees.
 5. **Publish only scrubbed artifacts.** Run `./scripts/scrub-check.sh` before pushing.
 
+## Checks in the public repository
+
+The repository is intentionally public, so its GitHub Actions do not call the
+private CFS harness. CI runs the local Node tests, installation smoke test and
+scrub check; the Rules job verifies that `CLAUDE.md` and `AGENTS.md` remain
+identical. Model review is still required by [the review-gate](docs/REVIEW_GATE.md)
+before a production deployment, but it is an accountable human/orchestrator
+step rather than a CI job that would silently fail to resolve a private workflow.
+
 ## Providers (subscription by default, paid API opt-in)
 
 Review and planning calls go through `.claude/hooks/providers.js`. By default every
