@@ -153,5 +153,7 @@ if [[ ",${AGENT_WORKFLOW_SMOKE_PACKS:-}," == *",cfs,"* ]]; then
 fi
 
 "$ROOT/scripts/scrub-check.sh"
+bash -n "$ROOT/scripts/install.sh"
+"$ROOT/scripts/install.sh" --help >/tmp/agent-workflow-install-help.log
 
 echo "smoke-test: OK ($DEMO/project)"

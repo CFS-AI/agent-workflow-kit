@@ -1,73 +1,72 @@
 # Agent Workflow Kit
 
-Shareable workflow template for running an engineering workspace with three cooperating surfaces:
+A portable, Git-friendly operating system for AI-assisted engineering work.
 
-- **Claude Code** — interactive orchestration, hooks, skill routing, daily/status memory.
-- **Scaffold / prime** — structured clarification → diagnosis → plan → approval → build/review loop.
-- **Codex Delegate** — routine implementation in a sandbox/worktree, accepted only through review-gate.
-- **Autonomy ladder** — bounded turn, goal, time and proactive loops with explicit evidence and stop conditions.
+Agent Workflow Kit gives a repository a consistent way to orchestrate Claude Code, Scaffold/Prime, and Codex: establish context, diagnose before changing code, delegate bounded work, verify it, and retain durable project state.
 
-The default install is domain-neutral. Optional packs add reusable domain workflows without secrets or private data.
-
-## What you get
+## Included
 
 ```text
 templates/
-  claude/              # CLAUDE.md, AGENTS.md, hooks, codex-delegate skill
-  scaffold/            # context/rules/constraints/done-criteria + skill index cards
-  demo-workspace/      # tiny project used by smoke-test
+  claude/              Claude Code instructions, hooks, and delegation skill
+  scaffold/            Context, rules, constraints, completion criteria, skills
+  demo-workspace/      Minimal project used by the smoke test
 packs/
-  cfs/                 # optional CFS/OpenClaw ops pack: cfs-hub + docs-intel workflows
+  cfs/                 Optional CFS/OpenClaw operations workflow pack
 scripts/
-  apply-kit.sh         # copy templates into a target repository
-  codex-exec.sh        # hardened Codex CLI wrapper
-  smoke-test.sh        # create demo workspace and validate structure
-  scrub-check.sh       # denylist check before publishing/sharing
-docs/
-  WORKFLOW.md          # operating model
-  INSTALL.md           # install/update instructions
-  SCRUBBING.md         # what must never be shared
-  REVIEW_GATE.md       # accepting delegated work safely
+  apply-kit.sh         Install templates in an existing repository
+  install.sh           Download, install, and optionally configure OpenCode agents
+  codex-exec.sh        Hardened Codex CLI wrapper
+  setup-codex-mcp.sh   Optional Claude Code ↔ Codex MCP transport setup
+  smoke-test.sh        Validate a clean installation
+  scrub-check.sh       Check publishable content against the denylist
+docs/                  Installation, workflow, review, and scrubbing guidance
 ```
 
 ## Quick start
 
 ```bash
-git clone <this-repo-url> agent-workflow-kit
+git clone https://github.com/Baggrisha/agent-workflow-kit.git
 cd agent-workflow-kit
 ./scripts/smoke-test.sh
 
-# Apply to an existing project:
-./scripts/apply-kit.sh /path/to/your/project
+# Install the core kit in an existing Git repository.
+./scripts/apply-kit.sh /path/to/project
 
-# Apply core + CFS pack:
-./scripts/apply-kit.sh --pack cfs /path/to/your/project
+# Include the optional CFS/OpenClaw operations pack.
+./scripts/apply-kit.sh --pack cfs /path/to/project
 ```
 
-After applying, open the target project in Claude Code or Scaffold and read:
+Existing files are preserved by default. Pass `--force` only when you intend to replace them.
 
-1. `CLAUDE.md`
-2. `AGENTS.md`
-3. `.scaffold/context.md`
-4. `.scaffold/rules.md`
-
-For MCP sync with Codex, install the transport explicitly after applying the kit:
+## One-command installer
 
 ```bash
-scripts/dev/setup-codex-mcp.sh --scope user
+curl -fsSL https://raw.githubusercontent.com/Baggrisha/agent-workflow-kit/main/scripts/install.sh | bash -s -- /path/to/project
 ```
 
-This registers only `codex mcp-server`; it does not copy credentials or modify sandbox profiles.
+The installer can optionally configure OpenCode's `fable` and `claude` agents interactively. For non-interactive use, specify the models explicitly:
 
-Then customize placeholders marked `TODO:`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Baggrisha/agent-workflow-kit/main/scripts/install.sh | \
+  bash -s -- \
+    --fable-model openai/gpt-5.6-sol --fable-variant high \
+    --claude-model google/gemini-2.5-pro --claude-variant high \
+    /path/to/project
+```
 
-## Core rules
+Use `--fable-model keep` or `--claude-model keep` to preserve an existing agent configuration. See [docs/INSTALL.md](docs/INSTALL.md) for options, update guidance, and optional Codex MCP transport.
 
-1. **State lives in git.** Keep `dev/status.md` and `dev/daily/YYYY-MM-DD.md` current.
-2. **No blind implementation.** Diagnose first, plan second, implement after approval.
-3. **Delegate routine work, not ownership.** Codex can edit; the orchestrator reviews, tests and commits.
-4. **One writer per worktree.** Parallel agents get isolated git worktrees.
-5. **Publish only scrubbed artifacts.** Run `./scripts/scrub-check.sh` before pushing.
+## Operating model
+
+1. **Read context first.** Consult `dev/status.md` and record session work in `dev/daily/`.
+2. **Diagnose before implementation.** Establish evidence, make a concise plan, and get approval for edits or deployments.
+3. **Delegate bounded work, not ownership.** Codex can research or implement inside a defined scope; the orchestrator reviews and accepts it.
+4. **Verify with an oracle.** Use a test, lint, health check, UI observation, or state diff—not an unsupported completion claim.
+5. **Keep the repository clean.** Commit accepted work and keep durable state in Git.
+6. **Publish safely.** Run `./scripts/scrub-check.sh` before sharing changes.
+
+Read the full [workflow](docs/WORKFLOW.md) and [review gate](docs/REVIEW_GATE.md) before using delegation or autonomous loops.
 
 ## Checks in the public repository
 
@@ -224,14 +223,25 @@ transport is injected, so the suite needs no API key and makes no network calls.
 
 ## Optional CFS pack
 
-The CFS pack is for OpenClaw/CFS-style operations and includes:
+The CFS pack adds reusable, shareable workflows for:
 
-- `cfs-hub-ops` — read-only infra monitoring triage through cfs-hub MCP;
-- `cfs-docs-update` — docs-first + docs-update workflow around CFS Docs/docs-intel;
-- `.mcp.cfs.example.json` — placeholder MCP config for `cfs-hub`, `docs-intel-team-dev`, `docs-intel-legal`.
+- read-only infrastructure triage through `cfs-hub`;
+- docs-first research and documentation updates through `docs-intel`.
 
-It deliberately excludes personal `/eod`, CEO private rollups, raw daily/status files, live secrets, raw client data and live infrastructure addresses.
+It ships only templates and placeholder MCP configuration—never credentials, private operations data, live infrastructure addresses, or personal work logs. Details: [packs/cfs/README.md](packs/cfs/README.md).
+
+## Validate before publishing
+
+```bash
+./scripts/smoke-test.sh
+./scripts/scrub-check.sh
+
+# Also validate the optional pack.
+AGENT_WORKFLOW_SMOKE_PACKS=cfs ./scripts/smoke-test.sh
+```
+
+The scrubber is a safety net, not a substitute for review. Read [docs/SCRUBBING.md](docs/SCRUBBING.md) and add project-specific terms to `.scrub-denylist`.
 
 ## License
 
-MIT — use, fork and adapt.
+[MIT](LICENSE)
