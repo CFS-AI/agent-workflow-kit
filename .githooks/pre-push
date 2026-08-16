@@ -1,133 +1,149 @@
 #!/usr/bin/env bash
-# Обязательные проверки перед отправкой в общий репозиторий.
 #
-# CI организации отключён, поэтому это единственное место, где проверки ещё
-# выполняются.
+# Проверки перед отправкой — то, что раньше делал общий CI организации.
 #
-# Подключение - один раз в каждом клоне и в каждом worktree:
+# Механика взята из хука, который уже работал в openclaw-dev и cfs-datalake:
+# он старше и аккуратнее, повторно изобретать его было бы вредно. Здесь к ней
+# добавлено только то, чего требует раскатка на два десятка разных репозиториев:
+# область проверок берётся из самого репозитория, а не задаётся жёстко, и
+# блокировка включается по согласию репозитория.
+#
+# Включение — один раз в каждом клоне и в каждом worktree:
 #   ./.githooks/install
 #
-# Что блокирует отправку всегда: поиск секретов. Это была единственная
-# обязательная проверка общего CI (`ci-summary` в cfs-harness), и репозитории
-# её проходили.
-#
-# Стиль, типы и тесты блокируют только там, где репозиторий это явно разрешил -
-# файлом `.githooks/enforce` со строками `lint`, `types`, `tests`. Так сделано
-# намеренно: на 16.08 чистый main как минимум одного боевого репозитория не
-# проходит ruff, и блокирующая проверка остановила бы там любую отправку в
-# первый же день. Репозиторий приводят к зелёному, потом добавляют строку.
-#
-# Проверки стиля и тестов смотрят на рабочее дерево, а не на отправляемые
-# коммиты: именно рабочее дерево уедет следующим коммитом.
+# Обход: git push --no-verify. Это не отказ хука, а отправка, которую никто не
+# проверил, и за ней больше нет CI, который заметит.
 set -uo pipefail
 
-RED=$'\033[31m'; YELLOW=$'\033[33m'; GREEN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
-[[ -t 2 ]] || { RED=""; YELLOW=""; GREEN=""; DIM=""; OFF=""; }
+# git отдаёт хукам GIT_DIR и его родню, указывающие на отправляемый репозиторий.
+# Любая проверка, создающая собственный репозиторий — а тесты brain и runtime
+# так делают, — начинает молча работать с чужим и падает так, как не падает при
+# ручном запуске.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY
+unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_QUARANTINE_PATH GIT_COMMON_DIR
 
-failed=0
-say()  { printf '%s\n' "$*" >&2; }
-fail() { say "${RED}БЛОК${OFF}     $*"; failed=1; }
-warn() { say "${YELLOW}ВНИМАНИЕ${OFF} $*"; }
-skip() { say "${DIM}пропуск  $*${OFF}"; }
-ok()   { say "${GREEN}ок${OFF}       $*"; }
+# Имя удалённого репозитория git передаёт первым аргументом. Считать его
+# «origin» нельзя: при отправке ветки во второй удалённый репозиторий коммиты,
+# уже лежащие в origin, там отсутствуют и остались бы непроверенными.
+remote_name=${1:-origin}
 
 repo_root=$(git rev-parse --show-toplevel) || exit 1
 cd "$repo_root" || exit 1
 
-enforced() { [[ -f .githooks/enforce ]] && grep -qxE "[[:space:]]*$1[[:space:]]*" .githooks/enforce; }
-
-# Git передаёт в pre-push строки "<локальная ссылка> <sha> <удалённая ссылка> <sha>".
-zero='0000000000000000000000000000000000000000'
-ranges=()
+# Одна отправка может нести несколько ссылок, поэтому диапазоны накапливаются.
+# Строка с переводами строк, а не массив: пустой массив под `set -u` опасен на
+# том bash 3.2, который до сих пор поставляет macOS.
+zero=0000000000000000000000000000000000000000
+ranges=""
 while read -r _local_ref local_sha _remote_ref remote_sha; do
-  [[ -z "${local_sha:-}" || "$local_sha" == "$zero" ]] && continue
-  if [[ "${remote_sha:-$zero}" == "$zero" ]]; then
-    base=$(git merge-base "$local_sha" origin/HEAD 2>/dev/null) \
-      || base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base=""
-    if [[ -n "$base" ]]; then ranges+=("$base..$local_sha"); else ranges+=("$local_sha"); fi
+  [[ $local_sha == "$zero" ]] && continue
+  if [[ $remote_sha == "$zero" ]]; then
+    ranges+="$local_sha --not --remotes=$remote_name"$'\n'
   else
-    ranges+=("$remote_sha..$local_sha")
+    ranges+="$remote_sha..$local_sha"$'\n'
   fi
 done
 
-# Хук вызвали руками, без данных на входе - проверяем рабочее дерево целиком.
-manual=0
-[[ ${#ranges[@]} -eq 0 ]] && manual=1
+[[ -z $ranges ]] && exit 0
 
-say ""
-say "Проверки перед отправкой ${DIM}(CI организации отключён)${OFF}"
-say ""
+# Блокируют отправку только те ворота, которые репозиторий назвал в
+# .githooks/enforce (строки `lint`, `types`, `tests`). Поиск секретов блокирует
+# всегда и в этот список не входит: он единственный останавливает то, что уже
+# не отозвать обратно, и был единственной обязательной проверкой общего CI.
+enforced() { [[ -f .githooks/enforce ]] && grep -qxE "[[:space:]]*$1[[:space:]]*" .githooks/enforce; }
 
-# --- Секреты: блокируют всегда, пропуска нет -----------------------------------
-if ! command -v gitleaks >/dev/null 2>&1; then
-  fail "gitleaks не установлен - проверить историю на секреты нечем."
-  say "         Установить: brew install gitleaks"
-else
-  leaked=0
-  if [[ $manual -eq 1 ]]; then
-    gitleaks dir --no-banner --redact --exit-code 1 . >/dev/null 2>&1 || leaked=1
+blocked=""
+warned=""
+
+run() {  # run <ворота|-> <название> <команда...>
+  local gate=$1 name=$2; shift 2
+  local out; out=$(mktemp)
+  if "$@" >"$out" 2>&1; then
+    printf '  ок     %s\n' "$name"
   else
-    for range in "${ranges[@]}"; do
-      gitleaks git --no-banner --redact --exit-code 1 --log-opts="$range" . >/dev/null 2>&1 || leaked=1
-    done
+    if [[ $gate == "-" ]] || enforced "$gate"; then
+      printf '  БЛОК   %s\n' "$name"; blocked+="$name "
+    else
+      printf '  ! %s  (не блокирует: нет строки «%s» в .githooks/enforce)\n' "$name" "$gate"
+      warned+="$name "
+    fi
+    # pytest заканчивает страницами предупреждений, и обычный tail хоронит те
+    # две строки, где сказано что сломалось.
+    if grep -qE '^(FAILED|ERROR)' "$out"; then
+      grep -E '^(FAILED|ERROR)' "$out" | head -20 | sed 's/^/         /'
+    else
+      tail -15 "$out" | sed 's/^/         /'
+    fi
   fi
-  if [[ $leaked -eq 1 ]]; then
-    fail "gitleaks нашёл секрет в отправляемых коммитах."
-    say "         Показать: gitleaks git --redact --log-opts=\"${ranges[0]:-HEAD~1..HEAD}\" ."
-    say "         Секрет уже в истории - его нужно отозвать, а не только стереть из кода."
-  else
-    ok "секретов не найдено"
-  fi
-fi
-
-# --- Стиль и форматирование ----------------------------------------------------
-report() {  # report <ворота> <заголовок> <команда показа>
-  local gate=$1 title=$2 show=$3
-  if enforced "$gate"; then fail "$title"; say "         Показать: $show"
-  else warn "$title  ${DIM}(не блокирует: нет строки «$gate» в .githooks/enforce)${OFF}"; fi
+  rm -f "$out"
 }
+
+echo "проверки перед отправкой (заменяют отключённый CI):"
+
+# --- Стиль, типы, тесты --------------------------------------------------------
+# Область не выдумываем. У большинства репозиториев исходники лежат в src/ и
+# tests/, и линтовать сверх этого — значит ловить замечания в служебных
+# скриптах, которые репозиторий намеренно не проверяет. Проверено 17.08 на
+# openclaw-dev: `ruff check src/ tests/` — чисто, `ruff check .` — 36 замечаний.
+lint_paths=()
+[[ -d src ]] && lint_paths+=(src)
+[[ -d tests ]] && lint_paths+=(tests)
+[[ ${#lint_paths[@]} -eq 0 ]] && lint_paths=(.)
 
 if [[ -f pyproject.toml ]]; then
   if command -v ruff >/dev/null 2>&1; then
-    ruff check . >/dev/null 2>&1 && ok "ruff check" || report lint "ruff check нашёл замечания." "ruff check ."
-    ruff format --check . >/dev/null 2>&1 && ok "ruff format" || report lint "форматирование расходится." "ruff format ."
+    run lint "ruff check"  ruff check "${lint_paths[@]}"
+    run lint "ruff format" ruff format --check "${lint_paths[@]}"
   else
-    skip "ruff не установлен, стиль не проверен (pip install ruff)"
+    printf '  пропуск ruff не установлен (pip install ruff)\n'
   fi
 
   if grep -qE '^\[tool\.mypy\]' pyproject.toml 2>/dev/null || [[ -f mypy.ini ]]; then
     if command -v mypy >/dev/null 2>&1; then
-      mypy . >/dev/null 2>&1 && ok "mypy" || report types "mypy нашёл ошибки типов." "mypy ."
+      run types "mypy" mypy "${lint_paths[@]}"
     else
-      skip "mypy не установлен, типы не проверены (pip install mypy)"
+      printf '  пропуск mypy не установлен (pip install mypy)\n'
     fi
   fi
 fi
 
-# --- Тесты ---------------------------------------------------------------------
+[[ -x scripts/check_standard.py ]] && run lint "стандарт разработки" python scripts/check_standard.py
+
 if [[ "${PREPUSH_SKIP_TESTS:-}" == "1" ]]; then
-  warn "тесты пропущены по PREPUSH_SKIP_TESTS=1"
+  printf '  пропуск тесты сняты через PREPUSH_SKIP_TESTS=1\n'
 elif [[ -f pyproject.toml || -d tests ]]; then
   if command -v pytest >/dev/null 2>&1; then
-    started=$SECONDS
-    if pytest -q >/dev/null 2>&1; then
-      ok "pytest ($((SECONDS - started)) с)"
-    else
-      report tests "тесты не проходят." "pytest -q"
-    fi
+    run tests "pytest" pytest -q
   else
-    skip "pytest не установлен, тесты не запускались"
+    printf '  пропуск pytest не установлен\n'
   fi
 fi
 
-say ""
-if [[ $failed -ne 0 ]]; then
-  say "${RED}Отправка остановлена.${OFF} Почини перечисленное и повтори."
-  say "Если тесты долгие и правка их не касается: ${DIM}PREPUSH_SKIP_TESTS=1 git push${OFF}"
-  say "Не обходи через --no-verify: он снимает и проверку секретов тоже."
-  say ""
+# --- Секреты: блокируют всегда -------------------------------------------------
+# Отсутствие сканера отклоняет отправку, а не пропускает её: иначе ворота тихо
+# становятся слабее той проверки CI, которую заменяют, ровно там, где это
+# важнее всего. --redact держит саму находку вне терминала: хук, напечатавший
+# пойманное значение, уже слил его в историю терминала и в запись экрана.
+if ! command -v gitleaks >/dev/null 2>&1; then
+  printf '  БЛОК   gitleaks не установлен — brew install gitleaks\n'
+  blocked+="gitleaks "
+else
+  while IFS= read -r range; do
+    [[ -z $range ]] && continue
+    # shellcheck disable=SC2086
+    run - "gitleaks ${range:0:24}" gitleaks git --no-banner --redact --exit-code 1 --log-opts="$range" .
+  done <<<"$ranges"
+fi
+
+if [[ -n $blocked ]]; then
+  printf '\nОтправка остановлена: %s\n' "$blocked"
+  printf 'Почини, либо push --no-verify, если сознательно отправляешь непроверенное.\n'
+  printf 'Долгие тесты и правка их не касается: PREPUSH_SKIP_TESTS=1 git push\n'
   exit 1
 fi
-say "${GREEN}Готово к отправке.${OFF}"
-say ""
+if [[ -n $warned ]]; then
+  printf '\nПроверки не пройдены, но не блокируют: %s\n' "$warned"
+  printf 'Включить блокировку: добавь lint/types/tests в .githooks/enforce\n'
+fi
+echo "готово к отправке"
 exit 0
