@@ -44,7 +44,26 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
   fi
 done
 
-[[ -z $ranges ]] && exit 0
+# Пустой ввод бывает в двух случаях: git не даёт ничего отправлять — тогда
+# проверять нечего, — и ручной прогон `./.githooks/pre-push < /dev/null`, о
+# котором сказано и в инструкции, и в установщике. Раньше он молча выходил с
+# нулём, ничего не проверив: человек читал пустоту как «всё чисто». Теперь это
+# сухой прогон: стиль, типы и тесты идут как обычно, а секреты ищутся по
+# рабочему каталогу — там же лежит и незакоммиченное.
+dry_run=0
+if [[ -z $ranges ]]; then
+  dry_run=1
+  # Сухой прогон отвечает на тот же вопрос, что и отправка: «что будет, если
+  # отправить сейчас». Поэтому и диапазон тот же, какой взял бы git — своя ветка
+  # против того, что уже лежит в удалённом репозитории. Сканировать вместо этого
+  # весь рабочий каталог заманчиво, но там лежат тестовые ключи-пустышки, и
+  # ворота краснели бы с первого дня.
+  if upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); then
+    ranges="$upstream..HEAD"$'\n'
+  else
+    ranges="HEAD --not --remotes"$'\n'
+  fi
+fi
 
 # Блокируют отправку только те ворота, которые репозиторий назвал в
 # .githooks/enforce (строки `lint`, `types`, `tests`). Поиск секретов блокирует
@@ -54,6 +73,30 @@ enforced() { [[ -f .githooks/enforce ]] && grep -qxE "[[:space:]]*$1[[:space:]]*
 
 blocked=""
 warned=""
+
+# Инструменты берём из окружения репозитория, а не из PATH. Глобальный pytest
+# не видит пакет проекта: в свежем worktree он падает на импорте conftest, и
+# ворота печатают «тесты упали» там, где тесты вообще не запускались. С ruff и
+# mypy то же самое тише: версия из PATH находит не то, что пиннит репозиторий.
+# Своё окружение репозитория идёт первым, активированное — вторым. Обратный
+# порядок ломается ровно там, где это незаметно: VIRTUAL_ENV в оболочке может
+# указывать на общий pyenv, и тогда проверки идут в чужом окружении, а падение
+# выглядит как беда репозитория. Проверено 17.08 на atlas-vpn-bot.
+venv=""
+if [[ -x .venv/bin/python ]]; then
+  venv=$repo_root/.venv
+elif [[ -x venv/bin/python ]]; then
+  venv=$repo_root/venv
+elif [[ -n ${VIRTUAL_ENV:-} && -x $VIRTUAL_ENV/bin/python ]]; then
+  venv=$VIRTUAL_ENV
+fi
+
+# tool <имя> -> команда для запуска: из окружения репозитория, если она там есть.
+tool() {
+  if [[ -n $venv && -x $venv/bin/$1 ]]; then printf '%s' "$venv/bin/$1"
+  elif command -v "$1" >/dev/null 2>&1; then printf '%s' "$1"
+  fi
+}
 
 run() {  # run <ворота|-> <название> <команда...>
   local gate=$1 name=$2; shift 2
@@ -78,7 +121,11 @@ run() {  # run <ворота|-> <название> <команда...>
   rm -f "$out"
 }
 
-echo "проверки перед отправкой (заменяют отключённый CI):"
+if [[ $dry_run -eq 1 ]]; then
+  echo "сухой прогон, отправлять нечего:"
+else
+  echo "проверки перед отправкой (заменяют отключённый CI):"
+fi
 
 # --- Стиль, типы, тесты --------------------------------------------------------
 # Область не выдумываем. У большинства репозиториев исходники лежат в src/ и
@@ -91,16 +138,18 @@ lint_paths=()
 [[ ${#lint_paths[@]} -eq 0 ]] && lint_paths=(.)
 
 if [[ -f pyproject.toml ]]; then
-  if command -v ruff >/dev/null 2>&1; then
-    run lint "ruff check"  ruff check "${lint_paths[@]}"
-    run lint "ruff format" ruff format --check "${lint_paths[@]}"
+  ruff_bin=$(tool ruff)
+  if [[ -n $ruff_bin ]]; then
+    run lint "ruff check"  "$ruff_bin" check "${lint_paths[@]}"
+    run lint "ruff format" "$ruff_bin" format --check "${lint_paths[@]}"
   else
     printf '  пропуск ruff не установлен (pip install ruff)\n'
   fi
 
   if grep -qE '^\[tool\.mypy\]' pyproject.toml 2>/dev/null || [[ -f mypy.ini ]]; then
-    if command -v mypy >/dev/null 2>&1; then
-      run types "mypy" mypy "${lint_paths[@]}"
+    mypy_bin=$(tool mypy)
+    if [[ -n $mypy_bin ]]; then
+      run types "mypy" "$mypy_bin" "${lint_paths[@]}"
     else
       printf '  пропуск mypy не установлен (pip install mypy)\n'
     fi
@@ -109,11 +158,40 @@ fi
 
 [[ -x scripts/check_standard.py ]] && run lint "стандарт разработки" python scripts/check_standard.py
 
+# Отдельно от run(), потому что у pytest «тесты упали» (код 1) и «тесты не
+# запустились» (коды 2-4: сломанный conftest, пакета нет в окружении) — разные
+# новости. Печатать вторую как «упали» значит приучить проходить мимо строки,
+# которая на самом деле означает, что не проверено ничего.
+run_tests() {
+  local out code; out=$(mktemp)
+  "$@" >"$out" 2>&1; code=$?
+  local label="pytest"
+  case $code in
+    0) printf '  ок     pytest\n'; rm -f "$out"; return ;;
+    5) printf '  пропуск тестов в репозитории нет\n'; rm -f "$out"; return ;;
+    1) ;;
+    *) label="pytest (не запустился)" ;;
+  esac
+  if enforced tests; then
+    printf '  БЛОК   %s\n' "$label"; blocked+="$label "
+  else
+    printf '  ! %s  (не блокирует: нет строки «tests» в .githooks/enforce)\n' "$label"
+    warned+="$label "
+  fi
+  if grep -qE '^(FAILED|ERROR)' "$out"; then
+    grep -E '^(FAILED|ERROR)' "$out" | head -20 | sed 's/^/         /'
+  else
+    tail -15 "$out" | sed 's/^/         /'
+  fi
+  rm -f "$out"
+}
+
 if [[ "${PREPUSH_SKIP_TESTS:-}" == "1" ]]; then
   printf '  пропуск тесты сняты через PREPUSH_SKIP_TESTS=1\n'
 elif [[ -f pyproject.toml || -d tests ]]; then
-  if command -v pytest >/dev/null 2>&1; then
-    run tests "pytest" pytest -q
+  pytest_bin=$(tool pytest)
+  if [[ -n $pytest_bin ]]; then
+    run_tests "$pytest_bin" -q
   else
     printf '  пропуск pytest не установлен\n'
   fi
@@ -135,6 +213,10 @@ else
   done <<<"$ranges"
 fi
 
+if [[ -n $blocked && $dry_run -eq 1 ]]; then
+  printf '\nОстановило бы отправку: %s\n' "$blocked"
+  exit 1
+fi
 if [[ -n $blocked ]]; then
   printf '\nОтправка остановлена: %s\n' "$blocked"
   printf 'Почини, либо push --no-verify, если сознательно отправляешь непроверенное.\n'
@@ -145,5 +227,9 @@ if [[ -n $warned ]]; then
   printf '\nПроверки не пройдены, но не блокируют: %s\n' "$warned"
   printf 'Включить блокировку: добавь lint/types/tests в .githooks/enforce\n'
 fi
-echo "готово к отправке"
+if [[ $dry_run -eq 1 ]]; then
+  [[ -z $warned ]] && echo "замечаний нет"
+else
+  echo "готово к отправке"
+fi
 exit 0
