@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Включает проверки перед отправкой в этом клоне.
+#
+# Git намеренно не запускает ничего автоматически при клонировании, поэтому
+# команду нужно выполнить один раз в каждом клоне и в каждом worktree:
+#
+#   ./.githooks/install
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-push
+
+echo "Проверки перед отправкой включены для $root"
+echo "Проверить прямо сейчас, ничего не отправляя:  ./.githooks/pre-push < /dev/null"

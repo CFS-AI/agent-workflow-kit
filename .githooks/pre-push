@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Обязательные проверки перед отправкой в общий репозиторий.
+#
+# CI организации отключён, поэтому это единственное место, где проверки ещё
+# выполняются.
+#
+# Подключение - один раз в каждом клоне и в каждом worktree:
+#   ./.githooks/install
+#
+# Что блокирует отправку всегда: поиск секретов. Это была единственная
+# обязательная проверка общего CI (`ci-summary` в cfs-harness), и репозитории
+# её проходили.
+#
+# Стиль, типы и тесты блокируют только там, где репозиторий это явно разрешил -
+# файлом `.githooks/enforce` со строками `lint`, `types`, `tests`. Так сделано
+# намеренно: на 16.08 чистый main как минимум одного боевого репозитория не
+# проходит ruff, и блокирующая проверка остановила бы там любую отправку в
+# первый же день. Репозиторий приводят к зелёному, потом добавляют строку.
+#
+# Проверки стиля и тестов смотрят на рабочее дерево, а не на отправляемые
+# коммиты: именно рабочее дерево уедет следующим коммитом.
+set -uo pipefail
+
+RED=$'\033[31m'; YELLOW=$'\033[33m'; GREEN=$'\033[32m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+[[ -t 2 ]] || { RED=""; YELLOW=""; GREEN=""; DIM=""; OFF=""; }
+
+failed=0
+say()  { printf '%s\n' "$*" >&2; }
+fail() { say "${RED}БЛОК${OFF}     $*"; failed=1; }
+warn() { say "${YELLOW}ВНИМАНИЕ${OFF} $*"; }
+skip() { say "${DIM}пропуск  $*${OFF}"; }
+ok()   { say "${GREEN}ок${OFF}       $*"; }
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+enforced() { [[ -f .githooks/enforce ]] && grep -qxE "[[:space:]]*$1[[:space:]]*" .githooks/enforce; }
+
+# Git передаёт в pre-push строки "<локальная ссылка> <sha> <удалённая ссылка> <sha>".
+zero='0000000000000000000000000000000000000000'
+ranges=()
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [[ -z "${local_sha:-}" || "$local_sha" == "$zero" ]] && continue
+  if [[ "${remote_sha:-$zero}" == "$zero" ]]; then
+    base=$(git merge-base "$local_sha" origin/HEAD 2>/dev/null) \
+      || base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || base=""
+    if [[ -n "$base" ]]; then ranges+=("$base..$local_sha"); else ranges+=("$local_sha"); fi
+  else
+    ranges+=("$remote_sha..$local_sha")
+  fi
+done
+
+# Хук вызвали руками, без данных на входе - проверяем рабочее дерево целиком.
+manual=0
+[[ ${#ranges[@]} -eq 0 ]] && manual=1
+
+say ""
+say "Проверки перед отправкой ${DIM}(CI организации отключён)${OFF}"
+say ""
+
+# --- Секреты: блокируют всегда, пропуска нет -----------------------------------
+if ! command -v gitleaks >/dev/null 2>&1; then
+  fail "gitleaks не установлен - проверить историю на секреты нечем."
+  say "         Установить: brew install gitleaks"
+else
+  leaked=0
+  if [[ $manual -eq 1 ]]; then
+    gitleaks dir --no-banner --redact --exit-code 1 . >/dev/null 2>&1 || leaked=1
+  else
+    for range in "${ranges[@]}"; do
+      gitleaks git --no-banner --redact --exit-code 1 --log-opts="$range" . >/dev/null 2>&1 || leaked=1
+    done
+  fi
+  if [[ $leaked -eq 1 ]]; then
+    fail "gitleaks нашёл секрет в отправляемых коммитах."
+    say "         Показать: gitleaks git --redact --log-opts=\"${ranges[0]:-HEAD~1..HEAD}\" ."
+    say "         Секрет уже в истории - его нужно отозвать, а не только стереть из кода."
+  else
+    ok "секретов не найдено"
+  fi
+fi
+
+# --- Стиль и форматирование ----------------------------------------------------
+report() {  # report <ворота> <заголовок> <команда показа>
+  local gate=$1 title=$2 show=$3
+  if enforced "$gate"; then fail "$title"; say "         Показать: $show"
+  else warn "$title  ${DIM}(не блокирует: нет строки «$gate» в .githooks/enforce)${OFF}"; fi
+}
+
+if [[ -f pyproject.toml ]]; then
+  if command -v ruff >/dev/null 2>&1; then
+    ruff check . >/dev/null 2>&1 && ok "ruff check" || report lint "ruff check нашёл замечания." "ruff check ."
+    ruff format --check . >/dev/null 2>&1 && ok "ruff format" || report lint "форматирование расходится." "ruff format ."
+  else
+    skip "ruff не установлен, стиль не проверен (pip install ruff)"
+  fi
+
+  if grep -qE '^\[tool\.mypy\]' pyproject.toml 2>/dev/null || [[ -f mypy.ini ]]; then
+    if command -v mypy >/dev/null 2>&1; then
+      mypy . >/dev/null 2>&1 && ok "mypy" || report types "mypy нашёл ошибки типов." "mypy ."
+    else
+      skip "mypy не установлен, типы не проверены (pip install mypy)"
+    fi
+  fi
+fi
+
+# --- Тесты ---------------------------------------------------------------------
+if [[ "${PREPUSH_SKIP_TESTS:-}" == "1" ]]; then
+  warn "тесты пропущены по PREPUSH_SKIP_TESTS=1"
+elif [[ -f pyproject.toml || -d tests ]]; then
+  if command -v pytest >/dev/null 2>&1; then
+    started=$SECONDS
+    if pytest -q >/dev/null 2>&1; then
+      ok "pytest ($((SECONDS - started)) с)"
+    else
+      report tests "тесты не проходят." "pytest -q"
+    fi
+  else
+    skip "pytest не установлен, тесты не запускались"
+  fi
+fi
+
+say ""
+if [[ $failed -ne 0 ]]; then
+  say "${RED}Отправка остановлена.${OFF} Почини перечисленное и повтори."
+  say "Если тесты долгие и правка их не касается: ${DIM}PREPUSH_SKIP_TESTS=1 git push${OFF}"
+  say "Не обходи через --no-verify: он снимает и проверку секретов тоже."
+  say ""
+  exit 1
+fi
+say "${GREEN}Готово к отправке.${OFF}"
+say ""
+exit 0
